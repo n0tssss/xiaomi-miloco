@@ -29,6 +29,7 @@ export const useAuth = (t) => {
   const reqNumRef = useRef(0);
   const goToOhCodeRef = useRef(false);
   const loginUrlRef = useRef('');
+  const consentShownRef = useRef(false);
   const { MAX_RETRY_ATTEMPTS, RETRY_INTERVAL } = AUTH_CONFIG;
 
   /**
@@ -101,9 +102,10 @@ export const useAuth = (t) => {
         return;
       }
 
-      if (code === 0 && !is_logged_in && login_url && !goToOhCodeRef.current) {
+      if (code === 0 && !is_logged_in && login_url && !consentShownRef.current) {
         goToOhCodeRef.current = true;
         loginUrlRef.current = login_url;
+        consentShownRef.current = true;
         setShowConsentModal(true);
         return;
       }
@@ -125,6 +127,7 @@ export const useAuth = (t) => {
   const retryAuth = () => {
     reqNumRef.current = 0;
     goToOhCodeRef.current = false;
+    consentShownRef.current = false;
     initFetch();
   };
 
@@ -132,6 +135,10 @@ export const useAuth = (t) => {
    * Handle consent modal agree — open login URL then show the auth-code input modal
    */
   const handleConsentAgree = () => {
+    if (timeRef.current) {
+      clearTimeout(timeRef.current);
+      timeRef.current = null;
+    }
     setShowConsentModal(false);
     if (loginUrlRef.current) {
       window.open(loginUrlRef.current, '_blank');
@@ -147,6 +154,7 @@ export const useAuth = (t) => {
     setNeedRetryAuth(true);
     setLoading(false);
     goToOhCodeRef.current = false;
+    consentShownRef.current = false;
   };
 
   /**
@@ -170,6 +178,7 @@ export const useAuth = (t) => {
     setNeedRetryAuth(true);
     setLoading(false);
     goToOhCodeRef.current = false;
+    consentShownRef.current = false;
   };
 
   /**
