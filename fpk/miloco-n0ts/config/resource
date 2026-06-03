@@ -1,0 +1,7 @@
+{
+    "volume":
+    {
+        "description": "Data volume for miloco",
+        "required": false
+    }
+}

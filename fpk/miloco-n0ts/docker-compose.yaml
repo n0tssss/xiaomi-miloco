@@ -1,0 +1,18 @@
+services:
+  backend:
+    container_name: miloco-n0ts-backend
+    image: ghcr.io/n0tssss/miloco-backend:latest
+    network_mode: host
+    expose:
+      - "8000"
+    environment:
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+      - AI_ENGINE_HOST=0.0.0.0
+      - AI_ENGINE_PORT=8001
+      - BACKEND_LOG_LEVEL=info
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/app/miloco_server/.temp
+      - ./log/backend:/app/miloco_server/.temp/log
+    restart: unless-stopped

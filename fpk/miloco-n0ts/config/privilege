@@ -1,0 +1,8 @@
+{
+    "defaults":
+    {
+        "run-as": "package"
+    },
+    "username": "docker-miloco-n0ts",
+    "groupname": "docker-miloco-n0ts"
+}

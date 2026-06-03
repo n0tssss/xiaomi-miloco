@@ -1,0 +1,12 @@
+appname               = miloco-n0ts
+version               = 1.0.0
+display_name          = MiLoCo
+desc                  = 小米智能家居控制助手 - 基于 MiOT 协议的智能家居自动化工具
+arch                  = x86_64
+source                = thirdparty
+maintainer            = n0tssss
+maintainer_url        = https://github.com/n0tssss
+distributor           = n0tssss
+distributor_url       = https://github.com/n0tssss
+desktop_applaunchname = miloco-n0ts.Application
+service_port          = 8000
