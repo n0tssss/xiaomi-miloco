@@ -2,7 +2,7 @@
 
 <p align="center">English | <a href="README.zh.md">简体中文</a></p>
 
-Xiaomi's open-source AI solution for the future of whole-home intelligence. It uses the video and audio from Mi Home cameras as a full-modal perception gateway, the in-house MiMo large model as its intelligent brain, and runs as an Agent plugin on top of [OpenClaw](https://openclaw.ai) (or the open-source [Hermes Agent](https://github.com/NousResearch/hermes-agent) — see [Alternative runtime: Hermes Agent](#alternative-runtime-hermes-agent-open-source) below) to orchestrate whole-home devices for a proactive, intelligent experience.
+Xiaomi's open-source AI solution for the future of whole-home intelligence. It uses the video and audio from Mi Home cameras as a full-modal perception gateway, the in-house MiMo large model as its intelligent brain, and runs as an Agent plugin on top of [OpenClaw](https://openclaw.ai) (or the open-source [Hermes Agent](https://github.com/NousResearch/hermes-agent) — see [Install](#install) below) to orchestrate whole-home devices for a proactive, intelligent experience.
 
 Miloco 2.0 perceives what happens at home, makes proactive decisions and controls devices based on common sense, breaks down "vague and long-term" goals into trackable household tasks, recognizes family members, and—drawing on home memory—delivers personalized service to each member: querying and controlling devices, tuning the home to each member's comfort, or offering useful reminders at the right moment.
 
@@ -11,7 +11,7 @@ Miloco 2.0 perceives what happens at home, makes proactive decisions and control
 ## What's New
 
 - **2026-06-18** — Miloco 2.0 officially released: re-architected as an OpenClaw plugin, adding general common sense, identity recognition, home memory, household tasks, proactive intelligence, and a home dashboard. See [Core Features](#core-features) below.
-- **2026-06-19** — Hermes Agent compatibility: same 16 skills, same inbound webhook contract, now also runnable on the open-source [Hermes Agent](https://github.com/NousResearch/hermes-agent) runtime via `plugins/hermes/`. See [Alternative runtime: Hermes Agent](#alternative-runtime-hermes-agent-open-source) below.
+- **2026-06-19** — Hermes Agent compatibility: same 16 skills, same inbound webhook contract, now also runnable on the open-source [Hermes Agent](https://github.com/NousResearch/hermes-agent) runtime via `plugins/hermes/`. See [Install](#install) below.
 
 ## Core Features
 
@@ -39,10 +39,18 @@ Miloco 2.0 perceives what happens at home, makes proactive decisions and control
 
 ### Option 1: Install via the Agent (recommended)
 
-Send the following instruction to OpenClaw to complete the installation automatically:
+Send the following instruction to your Agent to complete the installation automatically:
+
+**OpenClaw**:
 
 ```text
 Please install the Miloco plugin for me: https://raw.githubusercontent.com/XiaoMi/xiaomi-miloco/main/scripts/install-guide.md
+```
+
+**Hermes Agent** (open-source, [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)):
+
+```text
+Please install the Miloco plugin for me: https://raw.githubusercontent.com/n0tssss/xiaomi-miloco/main/plugins/hermes/INSTALL_PROMPT.md
 ```
 
 ### Option 2: One-line command-line install
@@ -58,19 +66,6 @@ From the project root, run:
 ```bash
 bash scripts/install.sh --dev   # build from source (scripts/build.sh), then install locally
 ```
-
-### Alternative runtime: Hermes Agent (open-source)
-
-This plugin is not bundled with the official Miloco installer (Hermes is a third-party agent runtime). Install it from the fork:
-
-```bash
-git clone https://github.com/n0tssss/xiaomi-miloco.git
-cd xiaomi-miloco
-bash plugins/hermes/install-hermes.sh
-hermes gateway restart
-```
-
-Details, adapter lifecycle, and troubleshooting: [plugins/hermes/README.md](plugins/hermes/README.md).
 
 ---
 
@@ -98,14 +93,11 @@ Whichever method you choose above, native Windows is not supported—install and
 
 ## Quick Start
 
-After installation, restart your agent gateway so the plugin takes effect:
+After installation, restart your Agent gateway so the plugin takes effect:
 
 ```bash
-# OpenClaw (Options 1-3 above)
-openclaw gateway restart
-
-# Hermes (Alternative runtime above)
-hermes gateway restart
+openclaw gateway restart   # if you used Option 1/2/3 with OpenClaw
+hermes gateway restart     # if you used Option 1 with Hermes Agent
 ```
 
 Then open the home dashboard to complete the initial setup:
