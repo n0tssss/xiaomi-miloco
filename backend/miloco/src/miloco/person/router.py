@@ -67,6 +67,11 @@ async def list_persons(current_user: str = Depends(verify_token)):
 async def create_person(body: PersonCreate, current_user: str = Depends(verify_token)):
     logger.info("Create person - user: %s, name: %s", current_user, body.name)
     person_id = manager.person_service.create_person(body.name, body.role)
+    # 新增成员后级联刷新家庭档案 md（与 update_person 同款），否则 profile.md 的家庭成员段不含新成员
+    try:
+        manager.home_profile_service.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("级联刷新家庭档案失败(create) person_id=%s: %s", person_id, e)
     return NormalResponse(
         code=0, message="Person created", data={"person_id": person_id}
     )
@@ -1410,6 +1415,11 @@ async def register_commit(
             status_code=410,
             detail="pending session 过期 / 不存在 / 无目标身份",
         )
+    # 注册可能按 name 新建成员（member_id 缺失时），级联刷新家庭档案 md 让新成员进档案，否则 profile.md 不刷新
+    try:
+        manager.home_profile_service.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("级联刷新家庭档案失败(register_commit) person_id=%s: %s", result.person_id, e)
     return NormalResponse(
         code=0, message="committed",
         data={
