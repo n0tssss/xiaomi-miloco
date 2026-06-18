@@ -16,7 +16,7 @@ metadata:
 **安装方式（3 步全自动，不打断用户）：**
 
 ```bash
-git clone https://github.com/XiaoMi/xiaomi-miloco.git
+git clone https://github.com/n0tssss/xiaomi-miloco.git
 cd xiaomi-miloco
 bash plugins/hermes/install-hermes.sh
 hermes gateway restart
@@ -58,7 +58,7 @@ python3 -c "import aiohttp, httpx, croniter" 2>/dev/null || python3 -m pip insta
 ### 1.4 拉 fork
 
 ```bash
-test -d xiaomi-miloco || git clone https://github.com/XiaoMi/xiaomi-miloco.git
+test -d xiaomi-miloco || git clone https://github.com/n0tssss/xiaomi-miloco.git
 cd xiaomi-miloco && git pull --ff-only
 ```
 
