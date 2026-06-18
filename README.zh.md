@@ -2,7 +2,7 @@
 
 <p align="center"><a href="README.md">English</a> | 简体中文</p>
 
-小米面向未来的全屋智能 AI 开源方案，以米家摄像头的画面与声音为全模态感知入口，以自研 MiMo 大模型为智能大脑，以 Agent 插件形式运行在 [OpenClaw](https://openclaw.ai) 之上（也支持开源的 [Hermes Agent](https://github.com/NousResearch/hermes-agent)——见下方[备选运行时：Hermes Agent](#备选运行时hermes-agent开源)），联动全屋设备带来主动智能体验。
+小米面向未来的全屋智能 AI 开源方案，以米家摄像头的画面与声音为全模态感知入口，以自研 MiMo 大模型为智能大脑，以 Agent 插件形式运行在 [OpenClaw](https://openclaw.ai) 之上（也支持开源的 [Hermes Agent](https://github.com/NousResearch/hermes-agent)——见下方[安装](#安装)），联动全屋设备带来主动智能体验。
 
 Miloco 2.0 能感知家中发生的事件，能基于常识主动判断并操控设备，能将"模糊又长期"的目标拆解成可追踪的家庭任务，能识别家庭成员、依托家庭记忆为每位成员提供个性化服务——查询和控制设备、把家调到成员舒适的状态，或在合适的时机给出有用的提醒。
 
@@ -11,7 +11,7 @@ Miloco 2.0 能感知家中发生的事件，能基于常识主动判断并操控
 ## 最新动态
 
 - **2026-06-18** — Miloco 2.0 正式发布：重构为 OpenClaw 插件，新增通用常识、身份识别、家庭记忆、家庭任务、主动智能、家庭面板。详见下方[核心特性](#核心特性)。
-- **2026-06-19** — 新增 Hermes Agent 兼容：同一套 16 个 skill、同一个入站 webhook 契约，现在也能跑在开源 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 运行时上（通过 `plugins/hermes/`）。见下方[备选运行时：Hermes Agent](#备选运行时hermes-agent开源)。
+- **2026-06-19** — 新增 Hermes Agent 兼容：同一套 16 个 skill、同一个入站 webhook 契约，现在也能跑在开源 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 运行时上（通过 `plugins/hermes/`）。见下方[安装](#安装)。
 
 ## 核心特性
 
@@ -39,10 +39,18 @@ Miloco 2.0 能感知家中发生的事件，能基于常识主动判断并操控
 
 ### 方式一：通过 Agent 安装（推荐）
 
-向 OpenClaw 发送以下指令即可自动完成安装：
+向你的 Agent 发送以下指令即可自动完成安装：
+
+**OpenClaw**：
 
 ```text
 帮我安装 Miloco 插件：https://raw.githubusercontent.com/XiaoMi/xiaomi-miloco/main/scripts/install-guide.md
+```
+
+**Hermes Agent**（开源，[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)）：
+
+```text
+帮我安装 Miloco 插件：https://raw.githubusercontent.com/n0tssss/xiaomi-miloco/main/plugins/hermes/INSTALL_PROMPT.md
 ```
 
 ### 方式二：命令行一键安装
@@ -58,19 +66,6 @@ curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/inst
 ```bash
 bash scripts/install.sh --dev   # 从源码构建（scripts/build.sh）后本地安装
 ```
-
-### 备选运行时：Hermes Agent（开源）
-
-本插件未打包进 Miloco 官方安装器（Hermes 是第三方 Agent 运行时）。从 fork 安装：
-
-```bash
-git clone https://github.com/n0tssss/xiaomi-miloco.git
-cd xiaomi-miloco
-bash plugins/hermes/install-hermes.sh
-hermes gateway restart
-```
-
-适配层生命周期、排错等详见 [plugins/hermes/README.md](plugins/hermes/README.md)。
 
 ---
 
@@ -101,11 +96,8 @@ hermes gateway restart
 安装完成后，先重启你的 Agent 网关让插件生效：
 
 ```bash
-# OpenClaw（上方方式一二三）
-openclaw gateway restart
-
-# Hermes（备选运行时）
-hermes gateway restart
+openclaw gateway restart   # 如果用 OpenClaw（方式一二三）
+hermes gateway restart     # 如果用 Hermes Agent（方式一）
 ```
 
 随后打开家庭面板完成首次配置：
