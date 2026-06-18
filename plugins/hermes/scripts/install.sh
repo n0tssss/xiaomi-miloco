@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Miloco for Hermes Agent —— 安装脚本。
+# Miloco for Hermes Agent —— 手动 / 高级安装脚本。
 #
-# 做四件事：
+# 普通用户请用 ../install-hermes.sh（一键：复制 + patch + 启 adapter），
+# 这个脚本只在你**想自己一步步做**时用：只复制 skill 和插件，**不** patch
+# miloco config.json、**不**补 .env、**不**启 adapter。
+#
+# 它做三件事：
 #   1. 把 16 个 miloco-* skill 同步到 ~/.hermes/skills/（由 sync-skills.py 生成）
 #   2. 把 Hermes 插件 miloco-plugin/ 复制到 ~/.hermes/plugins/miloco/
 #   3. （可选）注册 4 个受管 cron —— 由插件启动时自 reconcile，此处仅提示
