@@ -57,21 +57,57 @@ plugins/hermes/
 
 ## 安装
 
+### 快速安装（一键，推荐）
+
 前置：已装 Hermes Agent（`~/.hermes` 存在）、miloco 后端 + `miloco-cli` 在 PATH。
 
 ```bash
-bash plugins/hermes/scripts/install.sh
+bash plugins/hermes/install-hermes.sh
 ```
 
-脚本会：同步 16 个 skill 到 `~/.hermes/skills/`、复制插件到 `~/.hermes/plugins/miloco/`，并打印后续需手动完成的 4 步配置（改 miloco `config.json` 的 `agent` 段、设 Hermes `API_SERVER_KEY`、启动 adapter 进程、重启 Hermes）。
+这一行会做完 7 件事：
 
-### 关键配置
+1. 前置检查（hermes / miloco-cli / python / `$MILOCO_HOME`）
+2. 同步 16 个 skill 到 `~/.hermes/skills/`
+3. 复制插件到 `~/.hermes/plugins/miloco/miloco-plugin/`
+4. 复制 adapter 到 `~/.hermes/plugins/miloco/adapter/`
+5. **自动 patch** `$MILOCO_HOME/config.json` 的 `agent` 段（备份 `config.json.bak-<ts>`）
+6. **自动**给 `~/.hermes/.env` 补 `API_SERVER_KEY`（如缺失则生成，存在则复用）
+7. **自动 nohup 启** adapter，PID 写到 `~/.hermes/miloco-adapter.pid`，日志到 `~/.hermes/miloco-adapter.log`
+
+**后续你只要做一件事**：
+
+```bash
+hermes gateway restart   # 让插件和新 API_SERVER_KEY 生效
+hermes chat -q "把客厅灯打开" -Q   # 试一下
+```
+
+脚本**幂等**，重跑不会破坏现有配置，会保留同一 Bearer 重启 adapter。
+
+### adapter 生命周期
+
+```bash
+bash plugins/hermes/scripts/miloco-adapter.sh start    # 启
+bash plugins/hermes/scripts/miloco-adapter.sh stop     # 停
+bash plugins/hermes/scripts/miloco-adapter.sh restart  # 重启
+bash plugins/hermes/scripts/miloco-adapter.sh status   # PID / 端口 / 健康
+bash plugins/hermes/scripts/miloco-adapter.sh logs     # tail -f 日志
+bash plugins/hermes/scripts/miloco-adapter.sh env      # 显当前 .env 里的环境变量
+```
+
+> adapter 默认端口 18789，与 OpenClaw 默认 webhook 端口一致，使 miloco 默认 `agent.webhook_url` 尽量不用改。
+
+### 手动 / 高级安装
+
+`scripts/install.sh` 保留给想自己一步步做的用户：只复制 skill 和插件，**不** patch miloco config.json、**不**补 .env、**不**启 adapter。装完按下面"关键配置"自己填 3 段。
+
+### 关键配置（手动安装参考）
 
 **miloco 后端** `$MILOCO_HOME/config.json` 的 `agent` 段：
 ```json
 "agent": {
   "webhook_url": "http://127.0.0.1:18789/miloco/webhook",
-  "auth_bearer": "<随机串>"
+  "auth_bearer": "<随机串，需与 adapter 的 ADAPTER_AUTH_BEARER 一致>"
 }
 ```
 
@@ -79,14 +115,14 @@ bash plugins/hermes/scripts/install.sh
 
 **适配进程**：
 ```bash
-ADAPTER_AUTH_BEARER=<同上> \
+ADAPTER_AUTH_BEARER=<同 agent.auth_bearer> \
 HERMES_API_URL=http://127.0.0.1:8642 \
 HERMES_API_KEY=<同 API_SERVER_KEY> \
 ADAPTER_PORT=18789 \
 python -m plugins.hermes.adapter
 ```
 
-> adapter 默认端口 18789，与 OpenClaw 默认 webhook 端口一致，使 miloco 默认 `agent.webhook_url` 尽量不用改。
+> 推荐用 `bash scripts/miloco-adapter.sh start` 替代直接 nohup，自带 PID/日志/健康检查。
 
 ## 与 OpenClaw 版的差异（已知降级）
 
