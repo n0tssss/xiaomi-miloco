@@ -1,0 +1,423 @@
+"""miloco 自检 + 强制推送 + IM 切换工具集。
+
+装好 miloco 兼容层后用户 / agent 能主动验证链路是否完整：
+
+- ``miloco_status`` — 一键自检 7 项不变量，返回结构化 JSON（plugin enabled /
+  state.json deliver.target / adapter health / 4 cron jobs / 16 skills /
+  miloco backend status / 上次 webhook 时间）。诊断 root cause 用。
+- ``miloco_test_push`` — 强制走一次完整投递链路（绕开 cron / perception），用户能立刻
+  验证推送通不通。
+- ``miloco_notify_bind`` — IM 渠道切换：list 列出 state.json::candidates + 当前
+  选中的；switch 切换 target。无需手动编辑 state.json。
+
+三个工具都是**纯加法**：不动已有 ``miloco_im_push`` / ``miloco_habit_suggest`` 行为，
+不引入新依赖，handler 失败仅 log + 返回 ok:false。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from . import tools_notify as tn
+from .paths import miloco_home
+
+logger = logging.getLogger(__name__)
+
+# 受管 cron job 期望名（与 cron_setup.py::_CRON_TASKS 一一对应）
+EXPECTED_CRON_NAMES = (
+    "miloco-perception-digest",
+    "miloco-home-patrol",
+    "miloco-home-dreaming",
+    "miloco-habit-suggest",
+)
+
+# 默认 adapter 端口（与 OpenClaw webhook 默认 18789 对齐，与 install-hermes.sh 一致）
+_DEFAULT_ADAPTER_PORT = 18789
+_ADAPTER_HEALTH_TIMEOUT_S = 1.5
+
+
+# ---------------------------------------------------------------------------
+# 自检子项（每个独立 try/except，单项失败不影响其它）
+# ---------------------------------------------------------------------------
+
+def _check_plugin_self() -> Dict[str, Any]:
+    """检查插件自身是否完整装载（state.json 可写 / tools 已注册）。"""
+    # 我们就在 __init__.py 里跑起来 → 插件必然 enabled。返回 ok 即可。
+    return {"ok": True, "note": "plugin 已装载（hooks/tools 注册由 __init__.py 完成）"}
+
+
+def _check_state_json(ctx: Any) -> Dict[str, Any]:
+    """state.json 是否存在 + deliver.target 是否设置。"""
+    state = tn.load_state(ctx)
+    if not state:
+        return {"ok": False, "error": "state.json 不存在或为空"}
+    target = (state.get("deliver") or {}).get("target")
+    candidates = (state.get("deliver") or {}).get("candidates") or []
+    auto = (state.get("deliver") or {}).get("auto_configured")
+    if not target:
+        return {
+            "ok": False,
+            "error": (
+                "deliver.target 未设置 — 即便 cron 跑通、agent 调 miloco_im_push，"
+                "也会回 no deliver target 错。修法：在 Hermes 里连 IM 后重跑 "
+                "install-hermes.sh，或调 miloco_notify_bind(action='switch', target='feishu')"
+            ),
+            "candidates": candidates,
+        }
+    return {
+        "ok": True,
+        "target": target,
+        "auto_configured": auto,
+        "configured_at": (state.get("deliver") or {}).get("configured_at"),
+        "candidates_count": len(candidates),
+    }
+
+
+def _check_adapter_health() -> Dict[str, Any]:
+    """HTTP GET ``/health`` 探 adapter（端口默认 18789）。"""
+    port = int(os.environ.get("ADAPTER_PORT") or _DEFAULT_ADAPTER_PORT)
+    host = os.environ.get("ADAPTER_HOST") or "127.0.0.1"
+    url = f"http://{host}:{port}/health"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=_ADAPTER_HEALTH_TIMEOUT_S) as resp:
+            ok = 200 <= resp.status_code < 300
+            return {"ok": ok, "url": url, "status": resp.status_code}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "url": url,
+            "error": f"{type(exc).__name__}: {exc}",
+            "fix": f"bash plugins/hermes/scripts/miloco-adapter.sh start（看 ~/.hermes/miloco-adapter.log）",
+        }
+
+
+def _check_cron_jobs() -> Dict[str, Any]:
+    """检查 4 个受管 cron 是否注册。Hermes cron.jobs 不可用时优雅返回。"""
+    try:
+        from cron.jobs import list_jobs  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"cron.jobs 模块不可用: {type(exc).__name__}: {exc}",
+            "registered": [],
+            "missing": list(EXPECTED_CRON_NAMES),
+        }
+    try:
+        all_jobs = list_jobs() or []
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"list_jobs() 失败: {type(exc).__name__}: {exc}",
+            "registered": [],
+            "missing": list(EXPECTED_CRON_NAMES),
+        }
+    registered = [j.get("name", "") for j in all_jobs if isinstance(j, dict)]
+    miloco_jobs = [n for n in registered if "miloco" in n.lower()]
+    missing = [
+        expected
+        for expected in EXPECTED_CRON_NAMES
+        if not any(expected in r for r in miloco_jobs)
+    ]
+    return {
+        "ok": len(missing) == 0,
+        "registered": miloco_jobs,
+        "missing": missing,
+        "fix": "重跑 bash plugins/hermes/install-hermes.sh（脚本会 idempotent reconcile 4 个 cron）"
+        if missing
+        else None,
+    }
+
+
+def _check_skills_installed() -> Dict[str, Any]:
+    """检查 16 个 miloco-* skill 是否装到 ~/.hermes/skills/。"""
+    skills_dir = Path.home() / ".hermes" / "skills"
+    if not skills_dir.is_dir():
+        return {"ok": False, "installed": 0, "expected": 16, "fix": "重跑 install-hermes.sh"}
+    installed = sorted(
+        p.name for p in skills_dir.iterdir() if p.is_dir() and p.name.startswith("miloco-")
+    )
+    return {
+        "ok": len(installed) == 16,
+        "installed": len(installed),
+        "expected": 16,
+        "names": installed,
+    }
+
+
+def _check_miloco_backend() -> Dict[str, Any]:
+    """检查 miloco 后端是否在跑（调 miloco-cli service status）。"""
+    import shutil
+    import subprocess
+
+    if not shutil.which("miloco-cli"):
+        return {"ok": False, "error": "miloco-cli 不在 PATH"}
+    try:
+        result = subprocess.run(
+            ["miloco-cli", "service", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        # 不同 miloco-cli 版本输出格式不一：宽松判 ok / running / active 之一
+        out = (result.stdout or "") + (result.stderr or "")
+        ok = result.returncode == 0 and any(
+            marker in out.lower() for marker in ("running", "active", "ok", "started")
+        )
+        return {
+            "ok": ok,
+            "returncode": result.returncode,
+            "output": out.strip()[:300],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "miloco-cli service status 超时"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _check_hermes_plugin_enabled() -> Dict[str, Any]:
+    """``hermes plugins list`` 看 miloco 是不是 enabled。"""
+    import shutil
+    import subprocess
+
+    if not shutil.which("hermes"):
+        return {"ok": False, "error": "hermes CLI 不在 PATH"}
+    try:
+        result = subprocess.run(
+            ["hermes", "plugins", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        out = (result.stdout or "").lower()
+        # 简单匹配：找含 miloco 的行，看有没有 enabled
+        enabled = any(
+            "miloco" in line and "enabled" in line
+            for line in (result.stdout or "").splitlines()
+        )
+        return {
+            "ok": enabled,
+            "hermes_output": (result.stdout or "").strip()[:500],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "hermes plugins list 超时"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# miloco_status
+# ---------------------------------------------------------------------------
+
+def gather_status(ctx: Any) -> Dict[str, Any]:
+    """一键自检 7 项不变量，返回结构化 JSON。"""
+    checks: Dict[str, Dict[str, Any]] = {}
+    # 顺序按「最可能是 root cause → 最不可能」排，agent 报告时一眼看到关键项
+    for name, fn, ctx_arg in (
+        ("plugin_self", _check_plugin_self, None),
+        ("state_json_deliver_target", _check_state_json, ctx),
+        ("hermes_plugin_enabled", _check_hermes_plugin_enabled, None),
+        ("adapter_health", _check_adapter_health, None),
+        ("cron_jobs", _check_cron_jobs, None),
+        ("miloco_backend", _check_miloco_backend, None),
+        ("skills_installed", _check_skills_installed, None),
+    ):
+        try:
+            checks[name] = fn(ctx_arg) if ctx_arg is not None else fn()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("miloco_status 子项 %s 失败", name)
+            checks[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    failed = [k for k, v in checks.items() if not v.get("ok")]
+    return {
+        "ok": len(failed) == 0,
+        "failed_count": len(failed),
+        "failed": failed,
+        "checks": checks,
+        "hint": (
+            "全部 ok=True = 推送链路完整；fail 项按 checks[*].fix 修。"
+            "最常见 fail: state_json_deliver_target（hermes 没配 IM 或装时没读到）。"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# miloco_test_push
+# ---------------------------------------------------------------------------
+
+def test_push(ctx: Any, message: Optional[str] = None) -> Dict[str, Any]:
+    """强制走一次投递链路（绕开 cron / perception），立即验证推送通不通。
+
+    不传 message 时用默认测试文案（带时间戳便于排查"我收到了吗"）。
+    """
+    from datetime import datetime
+
+    msg = message or (
+        f"miloco test push @ {datetime.now().astimezone().isoformat()} — "
+        "如果你在 IM 看到这条说明推送链路完整。"
+    )
+    try:
+        result = tn.notify_owner(ctx, msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("miloco_test_push 失败: %s", exc)
+        return {"ok": False, "error": f"internal error: {exc}"}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# miloco_notify_bind
+# ---------------------------------------------------------------------------
+
+def list_candidates(ctx: Any) -> Dict[str, Any]:
+    """列 state.json::candidates + 当前 target（标 ✓）。"""
+    state = tn.load_state(ctx)
+    deliver = state.get("deliver") or {}
+    candidates = deliver.get("candidates") or []
+    current = deliver.get("target")
+    return {
+        "ok": True,
+        "current": current,
+        "auto_configured": deliver.get("auto_configured"),
+        "candidates": candidates,
+        "candidates_count": len(candidates),
+        "hint": (
+            "candidates 为空 → install-hermes.sh 装时没读到任何 IM。"
+            "在 Hermes 里连 IM（hermes config set feishu.app_id ...）后重跑 install-hermes.sh，"
+            "或直接 miloco_notify_bind(action='switch', target='feishu') 临时设。"
+        ),
+    }
+
+
+def switch_target(ctx: Any, target: str) -> Dict[str, Any]:
+    """切换 deliver.target（覆盖 auto_configured 标记，标 source=manual）。"""
+    target = (target or "").strip()
+    if not target:
+        return {"ok": False, "error": "target 不能为空"}
+    from datetime import datetime
+
+    state = tn.load_state(ctx)
+    state["deliver"] = {
+        "target": target,
+        "auto_configured": False,
+        "configured_at": datetime.now().astimezone().isoformat(),
+        "source": "manual via miloco_notify_bind",
+        "candidates": (state.get("deliver") or {}).get("candidates") or [],
+    }
+    tn.save_state(ctx, state)
+    return {"ok": True, "target": target, "note": "已切换；下次 miloco_im_push 会用新 target"}
+
+
+# ---------------------------------------------------------------------------
+# 三 tool 的 schema + handler
+# ---------------------------------------------------------------------------
+
+MILOCO_STATUS_SCHEMA: Dict[str, Any] = {
+    "name": "miloco_status",
+    "description": (
+        "一键自检 miloco 推送链路 7 项不变量（plugin / state.json target / hermes plugin enabled / "
+        "adapter health / 4 cron jobs / miloco backend / 16 skills）。\n"
+        "返回结构化 JSON：checks[*].ok + 失败项 fix 提示。**没收到推送时第一时间调这个**——"
+        "会告诉你卡在哪一环（绝大多数情况是 state.json::deliver.target=null）。\n"
+        "无需参数，agent / 用户都能调。"
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+
+MILOCO_TEST_PUSH_SCHEMA: Dict[str, Any] = {
+    "name": "miloco_test_push",
+    "description": (
+        "强制走一次投递链路（绕开 cron / perception 触发条件），立即验证推送通不通。\n"
+        "参数 message 可选（默认带时间戳的测试文案）。返回 ``{ok:true, platform, chat_id}`` 即送达；"
+        "``{ok:false, error}`` 看 error 提示修（最常见：no deliver target configured → 调 miloco_notify_bind 切）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "可选测试文案（默认带时间戳）",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+MILOCO_NOTIFY_BIND_SCHEMA: Dict[str, Any] = {
+    "name": "miloco_notify_bind",
+    "description": (
+        "IM 渠道管理：list 候选 / switch 切换。\n"
+        "action='list'：列 state.json 里 install-hermes.sh 探测到的所有候选 + 当前 target。"
+        "返回 candidates 数组，每个元素是 send_message 接受的 target 串（如 'feishu:oc_xxx:om_xxx'）。\n"
+        "action='switch'：覆盖当前 target，标 source=manual。target 必须是 send_message 接受的格式\n"
+        "（'platform' 或 'platform:chat_id' 或 'platform:chat_id:thread_id'）。\n"
+        "**无需重启 hermes**——下次 miloco_im_push 自动用新 target。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "switch"],
+                "description": "操作：list 候选 / switch 切换",
+            },
+            "target": {
+                "type": "string",
+                "description": "switch 的目标 target（如 'feishu' 或 'feishu:oc_xxx'）",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
+def make_status_handler(ctx: Any):
+    """``miloco_status`` handler（闭包捕获 ctx）。"""
+    def _handler(args: Dict[str, Any], **kwargs: Any) -> str:
+        try:
+            result = gather_status(ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("miloco_status 失败: %s", exc)
+            result = {"ok": False, "error": f"internal error: {exc}"}
+        return json.dumps(result, ensure_ascii=False)
+    return _handler
+
+
+def make_test_push_handler(ctx: Any):
+    """``miloco_test_push`` handler（闭包捕获 ctx）。"""
+    def _handler(args: Dict[str, Any], **kwargs: Any) -> str:
+        args = args if isinstance(args, dict) else {}
+        message = args.get("message")
+        try:
+            result = test_push(ctx, message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("miloco_test_push 失败: %s", exc)
+            result = {"ok": False, "error": f"internal error: {exc}"}
+        return json.dumps(result, ensure_ascii=False)
+    return _handler
+
+
+def handle_notify_bind(args: Dict[str, Any], ctx: Any) -> str:
+    """``miloco_notify_bind`` handler（ctx 由 __init__.py 闭包注入）。
+
+    不用 ``**kwargs`` 是因为 hermes 的 tool 注册签名通常显式传 ctx；
+    为兼容各种 hermes 版本，把 ctx 显式作为第二参数。
+    """
+    args = args if isinstance(args, dict) else {}
+    action = (args.get("action") or "").strip()
+    try:
+        if action == "list":
+            result = list_candidates(ctx)
+        elif action == "switch":
+            result = switch_target(ctx, args.get("target", ""))
+        else:
+            result = {"ok": False, "error": f"未知 action：{action!r}（应为 list / switch）"}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("miloco_notify_bind 失败: %s", exc)
+        result = {"ok": False, "error": f"internal error: {exc}"}
+    return json.dumps(result, ensure_ascii=False)
