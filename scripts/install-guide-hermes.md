@@ -171,7 +171,7 @@ cd xiaomi-miloco
 bash plugins/hermes/install-hermes.sh
 ```
 
-脚本会做完 8 件事（幂等，可重复执行）：
+脚本会做完 9 件事（幂等，可重复执行）：
 
 1. 前置检查（python / miloco-cli / Hermes / config.json）
 2. 拿/复用 adapter Bearer
@@ -181,6 +181,7 @@ bash plugins/hermes/install-hermes.sh
 6. patch `$MILOCO_HOME/config.json` 的 `agent` 段（备份 `config.json.bak-<ts>-pid<nsec>`）
 7. 写 `~/.hermes/.env` 的 `API_SERVER_KEY` + 启 adapter（20s retry loop）
 8. `hermes plugins enable miloco`（idempotent，跳过已 enabled 的）
+9. 记录版本（hermes / miloco-cli / plugin / git_commit）到 `state.json::versions`，升级时打印 diff
 
 **如果脚本 exit ≠ 0**：看脚本打印的错误（前置检查 / patch / 启 adapter 任一步），跑 `bash plugins/hermes/scripts/miloco-adapter.sh logs` 看 adapter 日志，参考底部故障排除表。
 
