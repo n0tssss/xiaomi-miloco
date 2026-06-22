@@ -21,6 +21,7 @@ from typing import Any
 from aiohttp import web
 
 from .hermes_client import HermesClient
+from . import trace_reader
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +162,22 @@ def create_app(
                 )
                 return web.json_response(_ok(result))
             if action == "get_trace":
-                # Hermes 同步 chat 无独立 run 概念，turn 已在 webhook 返回时完成。
-                # observability 降级：直接告之 done，miloco 侧不阻塞。
+                # 从 plugin 写的 meta 文件读真实 turn meta（plugin trace.py 在
+                # on_session_end 时 flush），找不到则降级 done（向后兼容）。
+                payload_run_id = None
+                if isinstance(payload, dict):
+                    payload_run_id = payload.get("runId") or payload.get("traceId")
+                trace_resp = trace_reader.get_trace_response(payload_run_id)
                 elapsed = time.monotonic() - t_start
-                logger.info("[adapter] ← action=get_trace → status=done (降级) elapsed=%.2fs", elapsed)
-                return web.json_response(_ok({"status": "done"}))
+                logger.info(
+                    "[adapter] ← action=get_trace runId=%s → status=%s llm=%d tool=%d elapsed=%.2fs",
+                    payload_run_id or "-",
+                    trace_resp.get("status"),
+                    trace_resp.get("llmCallCount", 0),
+                    trace_resp.get("toolCallCount", 0),
+                    elapsed,
+                )
+                return web.json_response(_ok(trace_resp))
             logger.warning("[adapter] ← unknown action=%s", action)
             return web.json_response(
                 _fail(2001, f"Action '{action}' not found"), status=404

@@ -23,6 +23,7 @@ import sys
 
 from aiohttp import web
 
+from .gateway_watch import GatewayUrlWatcher, auto_restart_callback, read_current_api_url
 from .hermes_client import HermesClient
 from .server import create_app
 
@@ -60,6 +61,18 @@ def main() -> None:
         level=os.getenv("ADAPTER_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # 启动 hermes api URL watcher（默认开启）；state.json::adapter.auto_restart_on_url_change=false 关
+    if os.getenv("MILOCO_ADAPTER_WATCH_URL", "1").lower() in ("1", "true", "yes"):
+        # 启动时如果 env HERMES_API_URL 与 gateway_state.json 不一致 → warn（不强 reload，等 watcher 30s 后处理）
+        env_url = os.getenv("HERMES_API_URL", "").rstrip("/")
+        state_url = read_current_api_url()
+        if env_url and state_url and env_url != state_url:
+            logger.warning(
+                "hermes api URL 不一致: env=%s state=%s（watcher 30s 后会触发 reload）",
+                env_url, state_url,
+            )
+        watcher = GatewayUrlWatcher(on_change=auto_restart_callback)
+        watcher.start()
     host = os.getenv("ADAPTER_HOST", _DEFAULT_HOST)
     port = int(os.getenv("ADAPTER_PORT", str(_DEFAULT_PORT)))
     web.run_app(_build(), host=host, port=port)
