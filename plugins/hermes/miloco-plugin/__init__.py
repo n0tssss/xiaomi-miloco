@@ -4,8 +4,9 @@
 - ``pre_llm_call`` 钩子按 session profile 注入 miloco 上下文（identity / capabilities /
   perception / memory / notify / language + home-profile + pending-suggestions +
   device-catalog），移植自 openclaw ``hooks/prompt.ts``。
-- 三个 tool：``miloco_im_push`` / ``miloco_notify_bind``（两段式通知协议，移植自
-  ``tools/notify.ts``）、``miloco_habit_suggest``（习惯建议防骚扰状态机，移植自
+- 两个 tool：``miloco_im_push``（通知投递，对齐 OpenClaw 版
+  ``subagent.run({deliver:true})`` 体验：装好就能用，cron 场景下也能直接
+  投递）、``miloco_habit_suggest``（习惯建议防骚扰状态机，移植自
   ``home-profile/suggestions.ts``）。
 - 启动时 reconcile 4 个受管 cron job（移植自 ``home-profile/scheduler.ts``）。
 
@@ -16,7 +17,7 @@
 - ``plugins/openclaw/src/hooks/prompt.ts``       → context_injection.py
 - ``plugins/openclaw/src/home-profile/helpers.ts`` → context_injection.py
 - ``plugins/openclaw/src/home-profile/injection.ts`` → context_injection.py
-- ``plugins/openclaw/src/tools/notify.ts``       → tools_notify.py + notify_target.py
+- ``plugins/openclaw/src/tools/notify.ts``       → tools_notify.py
 - ``plugins/openclaw/src/home-profile/suggestions.ts`` → tools_habit.py
 - ``plugins/openclaw/src/home-profile/scheduler.ts`` → cron_setup.py
 
@@ -36,9 +37,7 @@ from .tools_habit import (
 )
 from .tools_notify import (
     MILOCO_IM_PUSH_SCHEMA,
-    MILOCO_NOTIFY_BIND_SCHEMA,
     make_im_push_handler,
-    make_notify_bind_handler,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,7 @@ TOOLSET = "miloco"
 
 
 def register(ctx) -> None:
-    """注册 pre_llm_call 钩子 + 3 个 tool，并 reconcile 受管 cron。
+    """注册 pre_llm_call 钩子 + 2 个 tool，并 reconcile 受管 cron。
 
     每个注册独立 try/except：单个失败不影响其余功能，也绝不让插件加载崩掉 Hermes。
     """
@@ -67,16 +66,6 @@ def register(ctx) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("注册 miloco_im_push 失败: %s", exc)
-
-    try:
-        ctx.register_tool(
-            name="miloco_notify_bind",
-            toolset=TOOLSET,
-            schema=MILOCO_NOTIFY_BIND_SCHEMA,
-            handler=make_notify_bind_handler(ctx),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("注册 miloco_notify_bind 失败: %s", exc)
 
     try:
         ctx.register_tool(
