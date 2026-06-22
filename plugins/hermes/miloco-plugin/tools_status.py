@@ -150,6 +150,101 @@ def _check_skills_installed() -> Dict[str, Any]:
     }
 
 
+def _check_versions(ctx: Any) -> Dict[str, Any]:
+    """state.json::versions 与当前系统对比——升级一致性检查。"""
+    state = tn.load_state(ctx)
+    versions = state.get("versions") or {}
+    if not versions:
+        return {
+            "ok": False,
+            "error": "state.json 没记录 versions（老版本 install，或没跑过 install-hermes.sh）",
+        }
+    # 当前系统版本
+    import shutil
+    import subprocess
+
+    cur_hermes = "unknown"
+    if shutil.which("hermes"):
+        try:
+            r = subprocess.run(["hermes", "--version"], capture_output=True, text=True, timeout=5)
+            cur_hermes = (r.stdout or r.stderr or "").strip().splitlines()[0] if r.returncode == 0 else f"err:{r.returncode}"
+        except Exception as exc:  # noqa: BLE001
+            cur_hermes = f"err:{exc}"
+    cur_miloco = "unknown"
+    if shutil.which("miloco-cli"):
+        try:
+            r = subprocess.run(["miloco-cli", "--version"], capture_output=True, text=True, timeout=5)
+            cur_miloco = (r.stdout or r.stderr or "").strip().splitlines()[0] if r.returncode == 0 else f"err:{r.returncode}"
+        except Exception as exc:  # noqa: BLE001
+            cur_miloco = f"err:{exc}"
+    # plugin 版本（从装好的 plugin.yaml 读）
+    try:
+        base = getattr(getattr(ctx, "manifest", None), "path", "")
+        plugin_yaml = Path(base) / "plugin.yaml" if base else None
+        cur_plugin = "unknown"
+        if plugin_yaml and plugin_yaml.is_file():
+            for line in plugin_yaml.read_text(encoding="utf-8").splitlines():
+                if line.startswith("version:"):
+                    cur_plugin = line.split(":", 1)[1].strip()
+                    break
+    except Exception:  # noqa: BLE001
+        cur_plugin = "unknown"
+
+    mismatches = []
+    for key, cur, recorded in (
+        ("hermes", cur_hermes, versions.get("hermes", "")),
+        ("miloco_cli", cur_miloco, versions.get("miloco_cli", "")),
+        ("plugin", cur_plugin, versions.get("plugin", "")),
+    ):
+        if recorded and recorded != "unknown" and cur != "unknown" and cur != recorded:
+            mismatches.append(f"{key}: 装时={recorded} 现在={cur}")
+    return {
+        "ok": len(mismatches) == 0,
+        "current": {"hermes": cur_hermes, "miloco_cli": cur_miloco, "plugin": cur_plugin},
+        "recorded": versions,
+        "mismatches": mismatches,
+        "fix": (
+            "重跑 bash plugins/hermes/install-hermes.sh 让 versions 更新到 state.json；"
+            "如果只 hermes 变了，跑 hermes gateway restart + bash plugins/hermes/scripts/miloco-adapter.sh restart"
+        ) if mismatches else None,
+    }
+
+
+def _check_trace_hooks() -> Dict[str, Any]:
+    """trace.py 是否被 register 了——通过查 $MILOCO_HOME/trace/agent/ 目录近期活动。"""
+    from .paths import miloco_home
+    trace_dir = miloco_home() / "trace" / "agent"
+    if not trace_dir.is_dir():
+        return {
+            "ok": False,
+            "error": "trace 目录不存在 — 还没任何 turn 跑过 trace hooks",
+            "fix": "export MILOCO_TRACE_DEBUG=1 后跑一个 turn（hermes -z '...'）",
+        }
+    # 看今天有没有 meta.json 写过
+    from datetime import datetime
+    today = trace_dir / datetime.now().strftime("%Y%m%d")
+    if not today.is_dir():
+        return {
+            "ok": True,
+            "note": "trace 目录在但今天没 turn 跑过（首次跑会建目录 + meta.json）",
+            "trace_dir": str(trace_dir),
+        }
+    metas = list(today.glob("*.meta.json"))
+    if not metas:
+        return {
+            "ok": True,
+            "note": "今天还没 turn 跑过（debug 模式需 MILOCO_TRACE_DEBUG=1）",
+            "trace_dir": str(trace_dir),
+        }
+    newest = max(metas, key=lambda p: p.stat().st_mtime)
+    return {
+        "ok": True,
+        "trace_files_today": len(list(today.glob("*.jsonl.gz"))),
+        "meta_files_today": len(metas),
+        "newest_meta": newest.name,
+    }
+
+
 def _check_miloco_backend() -> Dict[str, Any]:
     """检查 miloco 后端是否在跑（调 miloco-cli service status）。"""
     import shutil
@@ -226,6 +321,8 @@ def gather_status(ctx: Any) -> Dict[str, Any]:
         ("cron_jobs", _check_cron_jobs, None),
         ("miloco_backend", _check_miloco_backend, None),
         ("skills_installed", _check_skills_installed, None),
+        ("versions", _check_versions, ctx),
+        ("trace_hooks", _check_trace_hooks, None),
     ):
         try:
             checks[name] = fn(ctx_arg) if ctx_arg is not None else fn()

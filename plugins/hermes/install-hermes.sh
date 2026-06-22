@@ -57,7 +57,7 @@ step() { echo -e "${G}[${1}/${TOTAL_STEPS}]${N} ${2}"; }
 # 跟踪已生效步骤，失败时 trap 打印（给 agent / 用户明确当前状态）
 DONE_STEPS=()
 mark_done() { DONE_STEPS+=("$1"); }
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 
 # 用 EXIT trap 而不是 ERR trap，因为脚本里很多 `err ...; exit 1` 显式退出，
 # ERR trap 在显式 exit 时不触发，EXIT trap 任何时候都触发
@@ -617,6 +617,41 @@ else
   warn "找不到 hermes CLI，跳过 enable（装完手动跑 hermes plugins enable miloco）"
 fi
 mark_done 8
+
+# --- 9. 记录版本到 state.json（升级一致性检查用） ---
+step 9 "记录版本到 plugin state.json"
+HERMES_VER="$(command -v hermes >/dev/null 2>&1 && hermes --version 2>&1 | head -1 || echo unknown)"
+MILOCO_VER="$(command -v miloco-cli >/dev/null 2>&1 && miloco-cli --version 2>&1 | head -1 || echo unknown)"
+PLUGIN_VER="$(grep '^version:' "$HERMES_PLUGINS_DIR/miloco-plugin/plugin.yaml" 2>/dev/null | awk '{print $2}' || echo unknown)"
+GIT_COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+"$PYTHON" - "$PLUGIN_STATE" "$HERMES_VER" "$MILOCO_VER" "$PLUGIN_VER" "$GIT_COMMIT" <<'PY' || true
+import json, sys, datetime
+from pathlib import Path
+path, hermes_v, miloco_v, plugin_v, git_c = sys.argv[1:6]
+try:
+    state = json.loads(Path(path).read_text(encoding="utf-8")) if Path(path).exists() else {}
+except Exception:
+    state = {}
+old_versions = state.get("versions") or {}
+state["versions"] = {
+    "hermes": hermes_v,
+    "miloco_cli": miloco_v,
+    "plugin": plugin_v,
+    "git_commit": git_c,
+    "installed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+print(f"  hermes={hermes_v}  miloco-cli={miloco_v}  plugin={plugin_v}  commit={git_c}")
+# 检查升级变化
+old_plugin = old_versions.get("plugin") or ""
+old_commit = old_versions.get("git_commit") or ""
+if old_plugin and old_plugin != plugin_v:
+    print(f"  [升级] plugin: {old_plugin} → {plugin_v}")
+elif old_commit and old_commit != git_c:
+    print(f"  [升级] git_commit: {old_commit} → {git_c}")
+PY
+mark_done 9
 
 # --- 终态 ---
 cat <<EOF

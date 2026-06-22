@@ -81,7 +81,7 @@ def test_status_state_json_target_set(tmp_path: Path):
     assert result["target"] == "feishu"
 
 
-def test_gather_status_returns_7_checks(tmp_path: Path):
+def test_gather_status_returns_9_checks(tmp_path: Path):
     ctx = _FakeCtx(tmp_path)
     out = ts.gather_status(ctx)
     assert "checks" in out
@@ -93,6 +93,8 @@ def test_gather_status_returns_7_checks(tmp_path: Path):
         "cron_jobs",
         "miloco_backend",
         "skills_installed",
+        "versions",
+        "trace_hooks",
     }
     assert set(out["checks"].keys()) == expected
     # 至少有 failed_count 字段
@@ -106,6 +108,91 @@ def test_gather_status_doesnt_raise_when_external_unavailable(tmp_path: Path):
     out = ts.gather_status(ctx)
     # 应该正常返回 dict，不抛异常
     assert isinstance(out, dict)
+
+
+# ─── versions / trace_hooks 子项（Phase 3.1 + 3.2） ──────────────────────
+
+
+def test_versions_missing_when_state_empty(tmp_path: Path):
+    ctx = _FakeCtx(tmp_path)
+    out = ts._check_versions(ctx)
+    assert out["ok"] is False
+    assert "没记录 versions" in out["error"]
+
+
+def test_versions_match(tmp_path: Path):
+    """state.json::versions 与当前一致 → ok=True，无 mismatches。"""
+    import yaml as _y
+    plugin_yaml = tmp_path / "plugin.yaml"
+    plugin_yaml.write_text("version: 0.4.0\n", encoding="utf-8")
+    state = {
+        "versions": {
+            "hermes": "Hermes Agent v0.10.0 (2026.4.16)",
+            "miloco_cli": "miloco-cli 1.2.3",
+            "plugin": "0.4.0",
+            "git_commit": "abc1234",
+        }
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    ctx = _FakeCtx(tmp_path)
+    out = ts._check_versions(ctx)
+    # 不强求 ok=True（因为 hermes/miloco-cli 真实命令可能不在 PATH），但 mismatches 应为空
+    assert out["mismatches"] == []
+    assert out["recorded"]["plugin"] == "0.4.0"
+
+
+def test_versions_mismatch_detected(tmp_path: Path):
+    """plugin 升级但 state.json 没更新 → mismatches 含 plugin。"""
+    plugin_yaml = tmp_path / "plugin.yaml"
+    plugin_yaml.write_text("version: 0.5.0\n", encoding="utf-8")
+    state = {
+        "versions": {
+            "plugin": "0.4.0",
+        }
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    ctx = _FakeCtx(tmp_path)
+    out = ts._check_versions(ctx)
+    assert out["ok"] is False
+    assert any("plugin: 装时=0.4.0 现在=0.5.0" in m for m in out["mismatches"])
+
+
+def test_trace_hooks_empty_trace_dir(tmp_path: Path, monkeypatch):
+    """trace 目录不存在 → ok=False（首次跑）。"""
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    out = ts._check_trace_hooks()
+    assert out["ok"] is False
+    assert "trace 目录不存在" in out["error"]
+
+
+def test_trace_hooks_today_dir_no_files(tmp_path: Path, monkeypatch):
+    """trace 目录有但今天没 turn → ok=True + note。"""
+    from datetime import datetime
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    trace_dir = tmp_path / "trace" / "agent"
+    today = trace_dir / datetime.now().strftime("%Y%m%d")
+    today.mkdir(parents=True, exist_ok=True)
+    out = ts._check_trace_hooks()
+    assert out["ok"] is True
+    assert "今天还没" in out["note"]
+
+
+def test_trace_hooks_today_has_files(tmp_path: Path, monkeypatch):
+    """今天有 meta.json → ok=True + count。"""
+    from datetime import datetime
+    import time
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    today = tmp_path / "trace" / "agent" / datetime.now().strftime("%Y%m%d")
+    today.mkdir(parents=True, exist_ok=True)
+    (today / "sess-1__test.jsonl.gz").write_bytes(b"")
+    (today / "sess-1__test.meta.json").write_text(
+        json.dumps({"runId": "sess-1", "success": True}), encoding="utf-8"
+    )
+    out = ts._check_trace_hooks()
+    assert out["ok"] is True
+    assert out["meta_files_today"] == 1
+    assert out["trace_files_today"] == 1
+    assert out["newest_meta"] == "sess-1__test.meta.json"
 
 
 # ─── test_push ───────────────────────────────────────────────────────────
