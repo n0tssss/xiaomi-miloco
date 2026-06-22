@@ -31,6 +31,7 @@ import logging
 
 from .context_injection import inject_context
 from .cron_setup import reconcile_cron_jobs
+from .trace import register_trace_hooks
 from .tools_habit import (
     MILOCO_HABIT_SUGGEST_SCHEMA,
     handle_habit_suggest,
@@ -54,7 +55,7 @@ TOOLSET = "miloco"
 
 
 def register(ctx) -> None:
-    """注册 pre_llm_call 钩子 + 2 个 tool，并 reconcile 受管 cron。
+    """注册 pre_llm_call 钩子 + trace hooks + 5 个 tool，并 reconcile 受管 cron。
 
     每个注册独立 try/except：单个失败不影响其余功能，也绝不让插件加载崩掉 Hermes。
     """
@@ -63,6 +64,14 @@ def register(ctx) -> None:
         ctx.register_hook("pre_llm_call", inject_context)
     except Exception as exc:  # noqa: BLE001
         logger.exception("注册 pre_llm_call 失败: %s", exc)
+
+    # ── trace hooks（6 事件：pre/post_llm_call + pre/post_tool_call + on_session_start/end） ──
+    # 对齐 OpenClaw trace.ts：debug 模式写 $MILOCO_HOME/trace/agent/<date>/*.jsonl.gz + .meta.json
+    try:
+        n = register_trace_hooks(ctx)
+        logger.info("[miloco-trace] 已注册 %d 个 trace hooks", n)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[miloco-trace] 注册失败: %s", exc)
 
     # ── tools ──────────────────────────────────────────────────────────
     try:
