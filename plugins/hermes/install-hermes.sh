@@ -125,6 +125,95 @@ cp -r "$HERE/adapter" "$HERMES_PLUGINS_DIR/adapter"
 # 清 pycache
 find "$HERMES_PLUGINS_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 
+# --- 4.5 自动探测 Hermes 已配置的 IM 平台，写入插件 state.json ---
+# 让 miloco_im_push 在 cron 场景下也能直接投递，不需要 LLM 在 cron session 里
+# 完成"两段式 bind"（cron 没人可对话，原方案不可用）。
+# 检测 ~/.hermes/config.yaml 里哪些 platform 有 bot_token/token，取第一个
+# 作为默认 deliver target，target 写成 "platform"（send_message 用 home channel）。
+DETECTED_TARGET="$(
+  "$PYTHON" - "$HERMES_HOME" <<'PY'
+import json, sys, re
+from pathlib import Path
+try:
+    import yaml
+except ImportError:
+    print("", end=""); sys.exit(0)
+
+cfg_path = Path(sys.argv[1]) / "config.yaml"
+if not cfg_path.is_file():
+    print("", end=""); sys.exit(0)
+
+cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+# 候选 platform 顺序：国内用户优先 telegram / feishu / wecom
+CANDIDATES = (
+    "telegram", "feishu", "wecom", "discord", "slack",
+    "whatsapp", "signal", "mattermost", "dingtalk", "bluebubbles",
+    "matrix", "qqbot",
+)
+# 各平台判定"已配置"的 token 字段名
+TOKEN_KEYS = {
+    "telegram": ("bot_token", "token"),
+    "discord": ("bot_token", "token"),
+    "slack": ("bot_token", "app_token"),
+    "feishu": ("app_id", "app_secret", "verification_token"),
+    "wecom": ("corp_id", "corp_secret", "agent_id"),
+    "whatsapp": ("phone_number", "access_token"),
+    "signal": ("phone_number",),
+    "mattermost": ("url", "token"),
+    "dingtalk": ("app_key", "app_secret"),
+    "bluebubbles": ("server_url", "password"),
+    "matrix": ("homeserver", "access_token"),
+    "qqbot": ("app_id", "client_secret"),
+}
+for plat in CANDIDATES:
+    sec = cfg.get(plat)
+    if not isinstance(sec, dict):
+        continue
+    keys = TOKEN_KEYS.get(plat, ())
+    if any(sec.get(k) for k in keys):
+        # 找 home_channel chat_id/thread_id（可选）
+        hc = sec.get("home_channel") or {}
+        chat_id = (hc.get("chat_id") if isinstance(hc, dict) else None) or ""
+        thread_id = (hc.get("thread_id") if isinstance(hc, dict) else None) or ""
+        if chat_id:
+            target = f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else "")
+        else:
+            target = plat  # 裸 platform → send_message 用 home channel
+        print(target, end="")
+        sys.exit(0)
+print("", end="")
+PY
+)" || DETECTED_TARGET=""
+
+PLUGIN_STATE="$HERMES_PLUGINS_DIR/state.json"
+if [ -n "$DETECTED_TARGET" ]; then
+  "$PYTHON" - "$PLUGIN_STATE" "$DETECTED_TARGET" <<'PY'
+import json, sys, datetime
+from pathlib import Path
+path, target = sys.argv[1], sys.argv[2]
+try:
+    state = json.loads(Path(path).read_text(encoding="utf-8")) if Path(path).exists() else {}
+except Exception:
+    state = {}
+state["deliver"] = {
+    "target": target,
+    "auto_configured": True,
+    "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "source": "install-hermes.sh auto-detect from ~/.hermes/config.yaml",
+}
+Path(path).parent.mkdir(parents=True, exist_ok=True)
+Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+print(f"  → state.json deliver.target = {target}")
+PY
+  info "通知投递已自动配置：target=$DETECTED_TARGET"
+else
+  warn "未检测到 Hermes 已配置的 IM 平台（telegram/discord/...）"
+  warn "  → miloco 主动通知将无法送达。装完请："
+  warn "     1) 在 Hermes 里连一个 IM 平台（hermes config set telegram.bot_token ...）"
+  warn "     2) 手动编辑 ${PLUGIN_STATE}，加 deliver.target 字段，形如："
+  warn "        {\"deliver\": {\"target\": \"telegram\"}}"
+fi
+
 # --- 5. patch ${MILOCO_HOME}/config.json ---
 info "patch ${MILOCO_HOME}/config.json 的 agent 段..."
 TS="$(date +%Y%m%d-%H%M%S)"

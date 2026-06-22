@@ -56,8 +56,15 @@ test -f "${MILOCO_HOME:-$HOME/.openclaw/miloco}/config.json" || miloco-cli init
 ```json
 {
   "status": "ok",
-  "account": {"is_bound": false, "bind_url": "https://account.xiaomi.com/oauth2/authorize?..."},
-  "model":   {"configured": false, "model": "xiaomi/mimo-v2.5", "base_url": "https://api.xiaomimimo.com/v1"}
+  "account": {
+    "is_bound": false,
+    "bind_url": "https://account.xiaomi.com/oauth2/authorize?..."
+  },
+  "model": {
+    "configured": false,
+    "model": "xiaomi/mimo-v2.5",
+    "base_url": "https://api.xiaomimimo.com/v1"
+  }
 }
 ```
 
@@ -94,8 +101,9 @@ bash plugins/hermes/install-hermes.sh
 ```
 
 脚本会做完 7 件事（同 OpenClaw 装 OpenClaw 插件的体验）：
+
 1. 前置检查
-2. 同步 16 个 miloco-* skill 到 `~/.hermes/skills/`
+2. 同步 16 个 miloco-\* skill 到 `~/.hermes/skills/`
 3. 复制插件到 `~/.hermes/plugins/miloco/miloco-plugin/`
 4. 复制 adapter 到 `~/.hermes/plugins/miloco/adapter/`
 5. patch `$MILOCO_HOME/config.json` 的 `agent` 段（备份 `config.json.bak-<ts>`）
@@ -103,6 +111,7 @@ bash plugins/hermes/install-hermes.sh
 7. nohup 启 adapter，PID 写到 `~/.hermes/miloco-adapter.pid`
 
 **如果脚本 exit ≠ 0**：
+
 - 看脚本打印的错误（前置检查 / patch / 启 adapter 任一步）
 - 跑 `bash plugins/hermes/scripts/miloco-adapter.sh logs` 看 adapter 日志
 - 参考底部故障排除表，不要瞎猜
@@ -121,6 +130,7 @@ bash plugins/hermes/scripts/miloco-adapter.sh status
 ⚠️ **这 3 件事必须由用户在自己终端里执行，agent 不要尝试在 chat 里代收或代跑**。
 
 原因有两层：
+
 1. **Hermes 安全机制**会在 chat 消息里自动 mask 敏感字符串（base64 授权码、API key 等）——agent 看不到真值
 2. **某些命令**（如 `hermes gateway restart`）Hermes 自身的 anti-restart-loop 会拒绝在 gateway 进程内执行
 
@@ -171,6 +181,8 @@ agent 内部跑 `hermes gateway restart` 会被 Hermes 自身的 anti-restart-lo
 
 用户做完上面 3 件事，告诉你「绑好了 / 重启好了」之类，你再继续 Step 3 验证。**不要催用户、不要替用户执行、不要 echo 任何敏感值**。
 
+> **主动通知配置（install-hermes.sh 已自动处理）**：Step 2 跑 install-hermes.sh 时脚本会自动读 `~/.hermes/config.yaml`，找已配 `bot_token` 的 IM 平台（telegram / discord / slack / 飞书 / 企微 / ...），把 `deliver.target` 写到 `~/.hermes/plugins/miloco/state.json`。装完 cron / 感知触发的通知就能直接发出去，**不需要**用户手动 bind。如果没检测到任何 IM 平台（用户还没接 Telegram/Discord 等），脚本会 warn 并提示用户去 Hermes 配——这时主动通知暂不可用，但其它功能（出站对话、入站 webhook）仍正常。
+
 ---
 
 ## Step 3: Verify + Ask（agent 自验，仅必要时叫人）
@@ -182,6 +194,11 @@ agent 内部跑 `hermes gateway restart` 会被 Hermes 自身的 anti-restart-lo
 ```bash
 # 1. 插件 enabled？
 hermes plugins list | grep -i miloco
+
+# 1.5 通知投递 target 已自动配置？
+test -f "$HOME/.hermes/plugins/miloco/state.json" && \
+  python -c "import json; d=json.load(open(r'$HOME/.hermes/plugins/miloco/state.json')); print('deliver.target =', d.get('deliver',{}).get('target'))"
+# 期望输出形如：deliver.target = telegram  或  deliver.target = None（后者需用户去 Hermes 接 IM）
 
 # 2. 16 skill 装上？
 ls ~/.hermes/skills/miloco-* | wc -l   # 应 16
@@ -212,11 +229,11 @@ cd xiaomi-miloco && bash plugins/hermes/tests/test_install_e2e.sh   # 应 PASS: 
 
 ### 3.3 **这 3 类只让用户自己终端操作**（其它全自跑）
 
-| 触发条件 | 做什么 |
-|---|---|
-| 小米账号未绑 | 走 [Step 2.5-1](#1-小米账号-oauth-授权)：给 `bind_url`，让用户浏览器授权 + **自己终端跑** `miloco-cli account authorize` |
-| 模型未配 | 走 [Step 2.5-2](#2-模型-api-key-配置如果-step-12-的-model_configuredfalse)：让用户**自己终端跑** `miloco-cli config set model.omni.api_key` |
-| 重启 hermes | 走 [Step 2.5-3](#3-重启-hermes-gateway)：让用户**自己终端跑** `hermes gateway restart` |
+| 触发条件     | 做什么                                                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| 小米账号未绑 | 走 [Step 2.5-1](#1-小米账号-oauth-授权)：给 `bind_url`，让用户浏览器授权 + **自己终端跑** `miloco-cli account authorize`                    |
+| 模型未配     | 走 [Step 2.5-2](#2-模型-api-key-配置如果-step-12-的-model_configuredfalse)：让用户**自己终端跑** `miloco-cli config set model.omni.api_key` |
+| 重启 hermes  | 走 [Step 2.5-3](#3-重启-hermes-gateway)：让用户**自己终端跑** `hermes gateway restart`                                                      |
 
 > **绝对不要**在 chat 里要 OAuth 授权码 / API key —— Hermes 会 mask，agent 看不到也无法替你跑。
 
@@ -226,18 +243,18 @@ cd xiaomi-miloco && bash plugins/hermes/tests/test_install_e2e.sh   # 应 PASS: 
 
 ## 故障排除
 
-| 问题 | 解决 |
-|---|---|
-| `找不到 miloco-cli` | Step 1.2 应自动装；如果还缺，确认 `~/.local/bin` 在 PATH |
-| `找不到 ~/.hermes` | Step 1.1 应自动装；如果还缺，看 hermes 官方安装日志 |
-| `MILOCO_HOME` 没设 / config.json 找不到 | `export MILOCO_HOME=$HOME/.openclaw/miloco` 然后再跑，或 `miloco-cli init` |
-| `adapter 启动失败，端口 X 未监听` | `netstat -ano \| grep X`（Win）/ `lsof -iTCP:X -sTCP:LISTEN`（Mac/Linux）找占用 kill；或 `export ADAPTER_PORT=18790` 换端口重跑 install-hermes.sh |
-| `No module named aiohttp` | `pip install aiohttp httpx croniter` 后重跑 install-hermes.sh |
-| `hermes cron list` 没见 4 个 miloco 任务 | `pip install croniter` → `hermes gateway restart` |
-| `hermes chat` 报 401 / model 错 | 检查 `~/.hermes/config.yaml` 的 `model.api_key` 或对应 provider env |
-| 装完发现 adapter 没在跑 | `bash plugins/hermes/scripts/miloco-adapter.sh logs` 看日志；`status` 看 PID/端口/健康 |
-| adapter 启动后端口还在占 | 旧进程没杀干净：`bash plugins/hermes/scripts/miloco-adapter.sh stop` 再 start |
-| `git clone` / `git pull` 失败 | 网络问题；可设 `git config --global url."https://ghproxy.com/".insteadOf https://` 走镜像 |
+| 问题                                     | 解决                                                                                                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `找不到 miloco-cli`                      | Step 1.2 应自动装；如果还缺，确认 `~/.local/bin` 在 PATH                                                                                          |
+| `找不到 ~/.hermes`                       | Step 1.1 应自动装；如果还缺，看 hermes 官方安装日志                                                                                               |
+| `MILOCO_HOME` 没设 / config.json 找不到  | `export MILOCO_HOME=$HOME/.openclaw/miloco` 然后再跑，或 `miloco-cli init`                                                                        |
+| `adapter 启动失败，端口 X 未监听`        | `netstat -ano \| grep X`（Win）/ `lsof -iTCP:X -sTCP:LISTEN`（Mac/Linux）找占用 kill；或 `export ADAPTER_PORT=18790` 换端口重跑 install-hermes.sh |
+| `No module named aiohttp`                | `pip install aiohttp httpx croniter` 后重跑 install-hermes.sh                                                                                     |
+| `hermes cron list` 没见 4 个 miloco 任务 | `pip install croniter` → `hermes gateway restart`                                                                                                 |
+| `hermes chat` 报 401 / model 错          | 检查 `~/.hermes/config.yaml` 的 `model.api_key` 或对应 provider env                                                                               |
+| 装完发现 adapter 没在跑                  | `bash plugins/hermes/scripts/miloco-adapter.sh logs` 看日志；`status` 看 PID/端口/健康                                                            |
+| adapter 启动后端口还在占                 | 旧进程没杀干净：`bash plugins/hermes/scripts/miloco-adapter.sh stop` 再 start                                                                     |
+| `git clone` / `git pull` 失败            | 网络问题；可设 `git config --global url."https://ghproxy.com/".insteadOf https://` 走镜像                                                         |
 
 ---
 
