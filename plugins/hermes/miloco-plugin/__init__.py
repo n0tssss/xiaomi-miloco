@@ -39,6 +39,14 @@ from .tools_notify import (
     MILOCO_IM_PUSH_SCHEMA,
     make_im_push_handler,
 )
+from .tools_status import (
+    MILOCO_NOTIFY_BIND_SCHEMA,
+    MILOCO_STATUS_SCHEMA,
+    MILOCO_TEST_PUSH_SCHEMA,
+    handle_notify_bind,
+    make_status_handler,
+    make_test_push_handler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +84,37 @@ def register(ctx) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("注册 miloco_habit_suggest 失败: %s", exc)
+
+    # ── 自检 / 强制推送 / IM 切换（Phase 1：诊断 + 立即可感） ────────
+    try:
+        ctx.register_tool(
+            name="miloco_status",
+            toolset=TOOLSET,
+            schema=MILOCO_STATUS_SCHEMA,
+            handler=make_status_handler(ctx),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("注册 miloco_status 失败: %s", exc)
+
+    try:
+        ctx.register_tool(
+            name="miloco_test_push",
+            toolset=TOOLSET,
+            schema=MILOCO_TEST_PUSH_SCHEMA,
+            handler=make_test_push_handler(ctx),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("注册 miloco_test_push 失败: %s", exc)
+
+    try:
+        ctx.register_tool(
+            name="miloco_notify_bind",
+            toolset=TOOLSET,
+            schema=MILOCO_NOTIFY_BIND_SCHEMA,
+            handler=lambda args, **kw: handle_notify_bind(args, ctx),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("注册 miloco_notify_bind 失败: %s", exc)
 
     # ── 受管 cron reconcile ────────────────────────────────────────────
     # 放最后：cron 模块不在时 graceful 跳过，不影响已注册的 hook/tool。

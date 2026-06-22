@@ -144,21 +144,36 @@ class HermesClient:
 
         async with httpx.AsyncClient() as client:
             # --- 首次 chat（带 session 头，上下文连续）---
+            logger.info(
+                "[adapter] → Hermes session_id=%s url=%s/v1/chat/completions timeout=%.1fs msg_len=%d",
+                session_id, self._api_url, timeout_s, len(str(message)),
+            )
             try:
                 resp = await self._chat_once(client, messages, session_id, timeout_s)
             except httpx.TimeoutException:
-                logger.warning("hermes chat timeout session=%s", session_id)
+                logger.warning(
+                    "[adapter] ← Hermes TIMEOUT session=%s timeout=%.1fs", session_id, timeout_s
+                )
                 return {"runId": run_id, "status": "timeout"}
             except httpx.HTTPError as e:
-                logger.warning("hermes chat transport error session=%s: %s", session_id, e)
+                logger.warning(
+                    "[adapter] ← Hermes transport error session=%s: %s", session_id, e
+                )
                 return {"runId": run_id, "status": "error", "error": str(e)}
 
             # 2xx → 成功
             if 200 <= resp.status_code < 300:
+                logger.info(
+                    "[adapter] ← Hermes HTTP %d session=%s OK", resp.status_code, session_id
+                )
                 return {"runId": run_id, "status": "ok"}
 
             # 非 2xx：尝试识别溢出并自愈（无 session 头重试一次）
             err_text = self._extract_error_text(resp)
+            logger.warning(
+                "[adapter] ← Hermes HTTP %d session=%s err=%s",
+                resp.status_code, session_id, err_text[:200],
+            )
             if _looks_like_overflow(err_text):
                 logger.warning(
                     "[overflow-self-heal] context overflow suspected session=%s status=%s; "

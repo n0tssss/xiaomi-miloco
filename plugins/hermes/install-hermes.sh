@@ -21,6 +21,24 @@ set -euo pipefail
 # 强制 UTF-8 + POSIX 字符类，防止 "$VAR中文" 被 bash 误识别为变量名延续
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
+# --- CLI 参数解析（--diagnose / --reset-deliver） ---
+DIAGNOSE_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --diagnose) DIAGNOSE_ONLY=1 ;;
+    --help|-h)
+      cat <<EOF
+用法：bash install-hermes.sh [options]
+  （无参数）       完整安装（patch config / 写 .env / 复制 plugin / 启 adapter / enable plugin）
+  --diagnose    自检模式：跑 12 项检查输出 ✓/✗，不做任何修改
+  --reset-deliver 清空 state.json::deliver.target，强制重新探测 IM（搭配安装用）
+  -h, --help    显示本帮助
+EOF
+      exit 0
+      ;;
+  esac
+done
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -103,6 +121,179 @@ kill_adapter() {
     fi
   fi
 }
+
+# --- 0. --diagnose 模式：跑 12 项检查输出 ✓/✗ + 汇总报告，不做任何修改 ---
+if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
+  echo
+  echo "═══════════════════════════════════════════════════════════════"
+  echo " miloco × Hermes 链路自检（仅诊断，不修改任何文件）"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo
+
+  DIAG_OK=0
+  DIAG_FAIL=0
+  diag() {
+    local name="$1" ok="$2"
+    local detail="${3-}"  # set -u 安全：参数可能没传
+    if [ "$ok" = "1" ]; then
+      printf "  %b[✓]%b %s\n" "$G" "$N" "$name${detail:+ — $detail}"
+      DIAG_OK=$((DIAG_OK + 1))
+    else
+      printf "  %b[✗]%b %s\n" "$R" "$N" "$name${detail:+ — $detail}"
+      DIAG_FAIL=$((DIAG_FAIL + 1))
+    fi
+  }
+
+  # 1. python
+  if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+    diag "python 可用" 1 "$(command -v python3 || command -v python)"
+  else
+    diag "python 可用" 0 "请装 python3"
+  fi
+
+  # 2. python 依赖（aiohttp / httpx / croniter）
+  if command -v python3 >/dev/null 2>&1; then
+    PY=python3
+  else
+    PY=python
+  fi
+  MISSING_DEPS="$("$PY" -c "import aiohttp, httpx, croniter" 2>&1 | head -1 || true)"
+  if [ -z "$MISSING_DEPS" ]; then
+    diag "python 依赖 (aiohttp/httpx/croniter)" 1
+  else
+    diag "python 依赖 (aiohttp/httpx/croniter)" 0 "缺模块 — pip install aiohttp httpx croniter"
+  fi
+
+  # 3. miloco-cli
+  if command -v miloco-cli >/dev/null 2>&1; then
+    MILOCO_VER="$("$PY" -c 'import subprocess; r=subprocess.run(["miloco-cli","--version"],capture_output=True,text=True,timeout=5); print(r.stdout.strip()[:60])' 2>/dev/null || echo unknown)"
+    diag "miloco-cli 在 PATH" 1 "$MILOCO_VER"
+  else
+    diag "miloco-cli 在 PATH" 0 "上游装：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+  fi
+
+  # 4. miloco backend 在跑
+  if command -v miloco-cli >/dev/null 2>&1; then
+    ML_OUT="$(miloco-cli service status 2>&1 || true)"
+    if echo "$ML_OUT" | grep -qiE "running|active|ok|started"; then
+      diag "miloco backend 在跑" 1
+    else
+      diag "miloco backend 在跑" 0 "miloco-cli service start"
+    fi
+  else
+    diag "miloco backend 在跑" 0 "miloco-cli 不在 PATH"
+  fi
+
+  # 5. Hermes 目录
+  if [ -d "$HERMES_HOME" ]; then
+    diag "Hermes 目录存在" 1 "$HERMES_HOME"
+  else
+    diag "Hermes 目录存在" 0 "请装 Hermes Agent"
+  fi
+
+  # 6. miloco config.json
+  if [ -f "$MILOCO_HOME/config.json" ]; then
+    AGENT_URL="$("$PY" -c "import json; print(json.load(open(r'$MILOCO_HOME/config.json',encoding='utf-8')).get('agent',{}).get('webhook_url',''))" 2>/dev/null || echo "")"
+    diag "miloco config.json::agent.webhook_url" 1 "$AGENT_URL"
+  else
+    diag "miloco config.json" 0 "$MILOCO_HOME/config.json 不存在"
+  fi
+
+  # 7. Hermes .env 有 API_SERVER_KEY
+  if [ -f "$HERMES_HOME/.env" ] && grep -q '^API_SERVER_KEY=' "$HERMES_HOME/.env" 2>/dev/null; then
+    KEY_COUNT="$(grep -c '^API_SERVER_KEY=' "$HERMES_HOME/.env" 2>/dev/null || echo 0)"
+    if [ "$KEY_COUNT" = "1" ]; then
+      diag "Hermes .env::API_SERVER_KEY" 1
+    else
+      diag "Hermes .env::API_SERVER_KEY" 0 "发现 $KEY_COUNT 行重复，应为 1 行 — 编辑清理"
+    fi
+  else
+    diag "Hermes .env::API_SERVER_KEY" 0 "未设置 — 重跑 install-hermes.sh"
+  fi
+
+  # 8. plugin 装好
+  if [ -d "$HERMES_PLUGINS_DIR/miloco-plugin" ] && [ -f "$HERMES_PLUGINS_DIR/miloco-plugin/plugin.yaml" ]; then
+    diag "plugin 已装到 ~/.hermes/plugins/miloco/" 1
+  else
+    diag "plugin 已装" 0 "重跑 install-hermes.sh"
+  fi
+
+  # 9. plugin enabled
+  if command -v hermes >/dev/null 2>&1; then
+    if hermes plugins list 2>/dev/null | grep -E "miloco.*enabled" >/dev/null 2>&1; then
+      diag "plugin enabled (hermes plugins list)" 1
+    else
+      diag "plugin enabled" 0 "hermes plugins enable miloco"
+    fi
+  else
+    diag "plugin enabled" 0 "找不到 hermes CLI"
+  fi
+
+  # 10. adapter 在跑
+  if get_pid_by_port "$ADAPTER_PORT" >/dev/null 2>&1 && [ -n "$(get_pid_by_port "$ADAPTER_PORT" | tr -d ' \r\n')" ]; then
+    ADAPTER_PID_VAL="$(get_pid_by_port "$ADAPTER_PORT" | tr -d ' \r\n' | head -1)"
+    diag "adapter 进程 (端口 $ADAPTER_PORT)" 1 "PID=$ADAPTER_PID_VAL"
+  else
+    diag "adapter 进程" 0 "bash plugins/hermes/scripts/miloco-adapter.sh start"
+  fi
+
+  # 11. adapter /health
+  ADAPTER_HEALTH=""
+  if command -v curl >/dev/null 2>&1; then
+    ADAPTER_HEALTH="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$ADAPTER_PORT/health" 2>/dev/null || echo "")"
+  fi
+  if [ "$ADAPTER_HEALTH" = "200" ]; then
+    diag "adapter /health" 1 "HTTP 200"
+  else
+    diag "adapter /health" 0 "HTTP ${ADAPTER_HEALTH:-no-response} — 看 $HERMES_HOME/miloco-adapter.log 末尾"
+  fi
+
+  # 12. state.json::deliver.target
+  if [ -f "$HERMES_PLUGINS_DIR/miloco-plugin/state.json" ]; then
+    DELIVER_TARGET="$("$PY" -c "import json; d=json.load(open(r'$HERMES_PLUGINS_DIR/miloco-plugin/state.json',encoding='utf-8')); print((d.get('deliver') or {}).get('target') or '(null)')" 2>/dev/null || echo "(parse-fail)")"
+    if [ "$DELIVER_TARGET" = "(null)" ] || [ "$DELIVER_TARGET" = "(parse-fail)" ] || [ -z "$DELIVER_TARGET" ]; then
+      diag "state.json::deliver.target" 0 "null — Hermes 没配 IM 或装时没读到，调 miloco_notify_bind(action='switch', target='feishu') 或重跑 install-hermes.sh"
+    else
+      diag "state.json::deliver.target" 1 "$DELIVER_TARGET"
+    fi
+  else
+    diag "state.json::deliver.target" 0 "state.json 不存在 — 重跑 install-hermes.sh"
+  fi
+
+  # 13. 16 个 skill
+  SKILL_COUNT="$(ls -d "$HERMES_HOME/skills/miloco-"* 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$SKILL_COUNT" = "16" ]; then
+    diag "16 个 miloco-* skill" 1
+  else
+    diag "16 个 miloco-* skill" 0 "只装到 $SKILL_COUNT 个 — 重跑 install-hermes.sh"
+  fi
+
+  # 14. 4 个 cron job（hermes cron list）
+  if command -v hermes >/dev/null 2>&1; then
+    CRON_MILOCO="$(hermes cron list 2>/dev/null | grep -ci 'miloco' || echo 0)"
+    CRON_MILOCO="$(echo "$CRON_MILOCO" | tr -d ' \r\n')"
+    if [ "$CRON_MILOCO" -ge 4 ] 2>/dev/null; then
+      diag "4 个受管 cron job" 1 "$CRON_MILOCO 个"
+    else
+      diag "4 个受管 cron job" 0 "只看到 $CRON_MILOCO 个 — 重跑 install-hermes.sh 让 reconcile 跑"
+    fi
+  else
+    diag "4 个受管 cron job" 0 "hermes CLI 不可用"
+  fi
+
+  echo
+  echo "═══════════════════════════════════════════════════════════════"
+  if [ "$DIAG_FAIL" -eq 0 ]; then
+    printf " %b全部 %d 项通过%b — 推送链路完整\n" "$G" "$DIAG_OK" "$N"
+    echo "═══════════════════════════════════════════════════════════════"
+    exit 0
+  else
+    printf " %b通过 %d / 失败 %d%b\n" "$R" "$DIAG_OK" "$DIAG_FAIL" "$N"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo " 修法：按上面 ✗ 项的提示操作；不确定先看 $HERE/INSTALL_KNOWN_ISSUES.md"
+    exit 1
+  fi
+fi
 
 # --- 1. 前置检查 ---
 step 1 "前置检查 (python / miloco-cli / Hermes / config.json)"

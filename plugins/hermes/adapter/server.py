@@ -85,12 +85,18 @@ def create_app(
     idem = _IdempotencyCache()
 
     async def _handle_webhook(request: "web.Request") -> "web.Response":
+        t_start = time.monotonic()
+        remote = request.remote or "?"
+
         # --- Bearer 鉴权 ---
         if auth_bearer:
             auth = request.headers.get("Authorization", "")
             token = auth[7:].strip() if auth.startswith("Bearer ") else ""
             if token != auth_bearer:
-                logger.warning("adapter webhook rejected: invalid bearer")
+                logger.warning(
+                    "[adapter] AUTH 401! remote=%s path=%s — expected_bearer=%s... got=%r",
+                    remote, request.path, auth_bearer[:8], token[:8] + "..." if token else "(empty)",
+                )
                 return web.json_response(
                     {"code": 3000, "message": "unauthorized"}, status=401
                 )
@@ -98,16 +104,33 @@ def create_app(
         # --- 解析 body ---
         try:
             body = await request.json()
-        except Exception:
+        except Exception as exc:
+            logger.warning("[adapter] POST %s body parse fail: %s", request.path, exc)
             return web.json_response(_fail(1001, "bad json"), status=400)
         if not isinstance(body, dict):
+            logger.warning("[adapter] POST %s body not dict: %r", request.path, type(body).__name__)
             return web.json_response(_fail(1001, "bad json"), status=400)
 
         action = body.get("action")
         if not action or not isinstance(action, str):
+            logger.warning("[adapter] POST %s missing action: keys=%s", request.path, list(body.keys()))
             return web.json_response(_fail(1001, "missing action"), status=400)
 
         payload = body.get("payload") or {}
+
+        # --- 入站摘要（每个 webhook 都打，方便排查推送链路） ---
+        if action == "agent" and isinstance(payload, dict):
+            logger.info(
+                "[adapter] → POST /miloco/webhook action=agent sessionKey=%s lane=%s "
+                "traceId=%s timeoutMs=%s message_len=%d",
+                payload.get("sessionKey", "main"),
+                payload.get("lane", "default"),
+                payload.get("traceId", "-"),
+                payload.get("timeoutMs", 180000),
+                len(str(payload.get("message", ""))),
+            )
+        else:
+            logger.info("[adapter] → POST /miloco/webhook action=%s remote=%s", action, remote)
 
         # --- 幂等去重（仅 agent 动作，按 idempotencyKey 缓存结果）---
         idem_key: str | None = None
@@ -117,7 +140,7 @@ def create_app(
                 idem_key = raw_key
                 cached = idem.get(idem_key)
                 if cached is not None:
-                    logger.info("adapter webhook idem hit key=%s", idem_key)
+                    logger.info("[adapter] idem HIT key=%s — 回缓存", idem_key)
                     return web.json_response(_ok(cached))
 
         # --- 路由 ---
@@ -128,16 +151,28 @@ def create_app(
                 result = await hermes_client.run_turn(payload)
                 if idem_key is not None:
                     idem.set(idem_key, result)
+                elapsed = time.monotonic() - t_start
+                logger.info(
+                    "[adapter] ← action=agent status=%s runId=%s elapsed=%.2fs error=%s",
+                    result.get("status"),
+                    result.get("runId", "-"),
+                    elapsed,
+                    result.get("error", "-")[:200] if result.get("error") else "-",
+                )
                 return web.json_response(_ok(result))
             if action == "get_trace":
                 # Hermes 同步 chat 无独立 run 概念，turn 已在 webhook 返回时完成。
                 # observability 降级：直接告之 done，miloco 侧不阻塞。
+                elapsed = time.monotonic() - t_start
+                logger.info("[adapter] ← action=get_trace → status=done (降级) elapsed=%.2fs", elapsed)
                 return web.json_response(_ok({"status": "done"}))
+            logger.warning("[adapter] ← unknown action=%s", action)
             return web.json_response(
                 _fail(2001, f"Action '{action}' not found"), status=404
             )
         except Exception as e:
-            logger.exception("adapter webhook action '%s' failed", action)
+            elapsed = time.monotonic() - t_start
+            logger.exception("[adapter] ← action=%s FAILED after %.2fs", action, elapsed)
             return web.json_response(_fail(3000, str(e)), status=500)
 
     app = web.Application()
