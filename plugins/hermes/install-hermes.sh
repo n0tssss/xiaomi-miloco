@@ -34,6 +34,27 @@ G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
 info() { echo -e "${G}[✓]${N} $*"; }
 warn() { echo -e "${Y}[!]${N} $*"; }
 err()  { echo -e "${R}[✗]${N} $*" >&2; }
+step() { echo -e "${G}[${1}/${TOTAL_STEPS}]${N} ${2}"; }
+
+# 跟踪已生效步骤，失败时 trap 打印（给 agent / 用户明确当前状态）
+DONE_STEPS=()
+mark_done() { DONE_STEPS+=("$1"); }
+TOTAL_STEPS=8
+
+# 用 EXIT trap 而不是 ERR trap，因为脚本里很多 `err ...; exit 1` 显式退出，
+# ERR trap 在显式 exit 时不触发，EXIT trap 任何时候都触发
+on_exit() {
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    err "脚本退出码=$rc"
+    echo
+    echo -e "${Y}已生效步骤:${N} ${DONE_STEPS[*]:-无}"
+    echo
+    echo "可能状态：半装（plugin 复制了 / config patch 了 / adapter 没起）"
+    echo "修复：重跑 bash $HERE/install-hermes.sh（幂等，自动 recover）"
+  fi
+}
+trap on_exit EXIT
 
 # 跨平台查占用某端口的进程 PID（Windows netstat / POSIX lsof/ss）
 # 注意：函数内对每个 pipeline 加 || true 兜底，因为脚本 set -o pipefail，
@@ -84,6 +105,7 @@ kill_adapter() {
 }
 
 # --- 1. 前置检查 ---
+step 1 "前置检查 (python / miloco-cli / Hermes / config.json)"
 command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 \
   || { err "找不到 python，请先装 python"; exit 1; }
 PYTHON="$(command -v python3 || command -v python)"
@@ -97,8 +119,10 @@ fi
 if [ ! -f "$MILOCO_HOME/config.json" ]; then
   err "找不到 ${MILOCO_HOME}/config.json，请确认 MILOCO_HOME 正确（或 export MILOCO_HOME=...）"; exit 1
 fi
+mark_done 1
 
 # --- 2. 拿/复用 Bearer ---
+step 2 "拿/复用 adapter Bearer"
 # 优先级：.env 已有的 API_SERVER_KEY > 旧 adapter pid 存在则重新生成 > 新生成
 if [ -f "$HERMES_HOME/.env" ] && grep -q '^API_SERVER_KEY=' "$HERMES_HOME/.env" 2>/dev/null; then
   BEARER="$(grep '^API_SERVER_KEY=' "$HERMES_HOME/.env" | head -1 | cut -d= -f2-)"
@@ -107,116 +131,205 @@ else
   BEARER="$("$PYTHON" -c 'import secrets; print(secrets.token_urlsafe(32))')"
   info "新生成 adapter Bearer: ${BEARER:0:8}..."
 fi
+mark_done 2
 
 # --- 3. 同步 skills ---
-info "生成并复制 16 个 miloco-* skill → ${HERMES_HOME}/skills/"
+step 3 "同步 16 个 miloco-* skill → ${HERMES_HOME}/skills/"
 "$PYTHON" "$HERE/scripts/sync-skills.py"
 mkdir -p "$HERMES_HOME/skills"
 cp -r "$HERE/skills"/miloco-* "$HERMES_HOME/skills/"
+mark_done 3
 
 # --- 4. 复制插件 + adapter ---
+step 4 "复制 Hermes 插件 + adapter → ${HERMES_PLUGINS_DIR}/"
 mkdir -p "$HERMES_PLUGINS_DIR"
-info "复制 Hermes 插件 → ${HERMES_PLUGINS_DIR}/miloco-plugin/"
+info "  复制 miloco-plugin/"
 rm -rf "$HERMES_PLUGINS_DIR/miloco-plugin"
 cp -r "$HERE/miloco-plugin" "$HERMES_PLUGINS_DIR/miloco-plugin"
-info "复制 adapter → ${HERMES_PLUGINS_DIR}/adapter/"
+info "  复制 adapter/"
 rm -rf "$HERMES_PLUGINS_DIR/adapter"
 cp -r "$HERE/adapter" "$HERMES_PLUGINS_DIR/adapter"
-# 清 pycache
+# 清 pycache + 预编译（首次启动少 ~2s）
 find "$HERMES_PLUGINS_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+"$PYTHON" -m compileall -q "$HERMES_PLUGINS_DIR/miloco-plugin" "$HERMES_PLUGINS_DIR/adapter" 2>/dev/null || true
+mark_done 4
 
 # --- 4.5 自动探测 Hermes 已配置的 IM 平台，写入插件 state.json ---
+step 4.5 "探测 IM 平台 → 写 plugin state.json::deliver.target"
 # 让 miloco_im_push 在 cron 场景下也能直接投递，不需要 LLM 在 cron session 里
 # 完成"两段式 bind"（cron 没人可对话，原方案不可用）。
-# 检测 ~/.hermes/config.yaml 里哪些 platform 有 bot_token/token，取第一个
-# 作为默认 deliver target，target 写成 "platform"（send_message 用 home channel）。
-DETECTED_TARGET="$(
+# 探测顺序：
+#   1) ~/.hermes/auth.json 的 providers（真连接凭据，首选）
+#   2) ~/.hermes/config.yaml 里哪些 platform 有 bot_token/token（fallback）
+# 候选 platform 顺序：国内用户优先 weixin / feishu / wecom / dingtalk / qqbot
+DETECTED_TARGETS_JSON="$(
   "$PYTHON" - "$HERMES_HOME" <<'PY'
-import json, sys, re
+import json, sys
 from pathlib import Path
 try:
     import yaml
 except ImportError:
-    print("", end=""); sys.exit(0)
+    yaml = None
 
-cfg_path = Path(sys.argv[1]) / "config.yaml"
-if not cfg_path.is_file():
-    print("", end=""); sys.exit(0)
-
-cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-# 候选 platform 顺序：国内用户优先 telegram / feishu / wecom
+home = Path(sys.argv[1])
+# 候选顺序：国内用户优先（weixin/feishu/wecom/dingtalk/qqbot），然后海外主流
 CANDIDATES = (
-    "telegram", "feishu", "wecom", "discord", "slack",
-    "whatsapp", "signal", "mattermost", "dingtalk", "bluebubbles",
-    "matrix", "qqbot",
+    "weixin", "feishu", "wecom", "dingtalk", "qqbot",
+    "telegram", "discord", "slack",
+    "whatsapp", "signal", "mattermost", "bluebubbles", "matrix",
 )
-# 各平台判定"已配置"的 token 字段名
+# 各平台判定"已配置"的 token 字段名（config.yaml 段）
 TOKEN_KEYS = {
-    "telegram": ("bot_token", "token"),
-    "discord": ("bot_token", "token"),
-    "slack": ("bot_token", "app_token"),
-    "feishu": ("app_id", "app_secret", "verification_token"),
-    "wecom": ("corp_id", "corp_secret", "agent_id"),
-    "whatsapp": ("phone_number", "access_token"),
-    "signal": ("phone_number",),
-    "mattermost": ("url", "token"),
-    "dingtalk": ("app_key", "app_secret"),
+    "telegram":  ("bot_token", "token"),
+    "discord":   ("bot_token", "token"),
+    "slack":     ("bot_token", "app_token"),
+    "feishu":    ("app_id", "app_secret", "verification_token"),
+    "wecom":     ("corp_id", "corp_secret", "agent_id"),
+    "whatsapp":  ("phone_number", "access_token"),
+    "signal":    ("phone_number",),
+    "mattermost":("url", "token"),
+    "dingtalk":  ("app_key", "app_secret"),
     "bluebubbles": ("server_url", "password"),
-    "matrix": ("homeserver", "access_token"),
-    "qqbot": ("app_id", "client_secret"),
+    "matrix":    ("homeserver", "access_token"),
+    "qqbot":     ("app_id", "client_secret"),
+    "weixin":    ("app_id", "app_secret", "token", "encoding_aes_key"),
 }
-for plat in CANDIDATES:
-    sec = cfg.get(plat)
-    if not isinstance(sec, dict):
-        continue
-    keys = TOKEN_KEYS.get(plat, ())
-    if any(sec.get(k) for k in keys):
-        # 找 home_channel chat_id/thread_id（可选）
-        hc = sec.get("home_channel") or {}
-        chat_id = (hc.get("chat_id") if isinstance(hc, dict) else None) or ""
-        thread_id = (hc.get("thread_id") if isinstance(hc, dict) else None) or ""
-        if chat_id:
-            target = f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else "")
-        else:
-            target = plat  # 裸 platform → send_message 用 home channel
-        print(target, end="")
-        sys.exit(0)
-print("", end="")
-PY
-)" || DETECTED_TARGET=""
 
-PLUGIN_STATE="$HERMES_PLUGINS_DIR/state.json"
-if [ -n "$DETECTED_TARGET" ]; then
-  "$PYTHON" - "$PLUGIN_STATE" "$DETECTED_TARGET" <<'PY'
+
+def build_target(plat, sec):
+    """把 platform 段解析成 send_message 的 target 串。"""
+    hc = sec.get("home_channel") or {}
+    chat_id = (hc.get("chat_id") if isinstance(hc, dict) else None) or ""
+    thread_id = (hc.get("thread_id") if isinstance(hc, dict) else None) or ""
+    if chat_id:
+        return f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else "")
+    return plat
+
+
+found = []  # 保留所有候选，让 state.json.candidates 可见
+
+# 1) auth.json providers（真实连接凭据；最权威）
+auth_path = home / "auth.json"
+auth_cfg = {}
+if auth_path.is_file():
+    try:
+        auth_cfg = json.loads(auth_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        auth_cfg = {}
+providers = auth_cfg.get("providers") if isinstance(auth_cfg, dict) else None
+if isinstance(providers, dict):
+    for plat in CANDIDATES:
+        p = providers.get(plat)
+        if isinstance(p, dict) and any(p.get(k) for k in ("connected", "status", "token", "bot_token", "app_id")):
+            if p.get("connected") is True or p.get("status") == "connected":
+                chat_id = p.get("chat_id") or p.get("home_chat_id") or ""
+                thread_id = p.get("thread_id") or ""
+                if chat_id:
+                    found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
+                else:
+                    found.append(plat)
+
+# 2) config.yaml 段（fallback；可能只是声明但未连）
+if not found:
+    cfg_path = home / "config.yaml"
+    if cfg_path.is_file() and yaml is not None:
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            cfg = {}
+        for plat in CANDIDATES:
+            sec = cfg.get(plat)
+            if not isinstance(sec, dict):
+                continue
+            keys = TOKEN_KEYS.get(plat, ())
+            if any(sec.get(k) for k in keys):
+                found.append(build_target(plat, sec))
+
+print(json.dumps(found, ensure_ascii=False), end="")
+PY
+)" || DETECTED_TARGETS_JSON='[]'
+
+DETECTED_TARGET="$("$PYTHON" - "$DETECTED_TARGETS_JSON" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+print(arr[0] if arr else "", end="")
+PY
+)"
+
+# state.json 必须写到 plugin 自己的目录里，因为 tools_notify.py::_state_path(ctx)
+# 用 ctx.manifest.path / "state.json" 解析（manifest.path 指向 plugin dir）。
+# 写到外面的话 plugin 永远读不到 → miloco_im_push 永远报 no deliver target。
+PLUGIN_STATE="$HERMES_PLUGINS_DIR/miloco-plugin/state.json"
+CANDIDATES_COUNT=$("$PYTHON" - "$DETECTED_TARGETS_JSON" <<'PY'
+import json, sys
+print(len(json.loads(sys.argv[1])), end="")
+PY
+)
+
+# --- 4.6 升级保留旧 deliver.target（除非 --reset-deliver）---
+RESET_DELIVER=0
+for arg in "$@"; do
+  case "$arg" in
+    --reset-deliver) RESET_DELIVER=1 ;;
+  esac
+done
+PRESERVED_TARGET=""
+if [ "$RESET_DELIVER" -eq 0 ] && [ -f "$PLUGIN_STATE" ]; then
+  PRESERVED_TARGET="$("$PYTHON" - "$PLUGIN_STATE" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    t = (d.get("deliver") or {}).get("target")
+    print(t or "", end="")
+except Exception:
+    print("", end="")
+PY
+)"
+fi
+
+"$PYTHON" - "$PLUGIN_STATE" "$DETECTED_TARGETS_JSON" "$PRESERVED_TARGET" <<'PY'
 import json, sys, datetime
 from pathlib import Path
-path, target = sys.argv[1], sys.argv[2]
+path, candidates_json, preserved = sys.argv[1], sys.argv[2], sys.argv[3]
+candidates = json.loads(candidates_json)
 try:
     state = json.loads(Path(path).read_text(encoding="utf-8")) if Path(path).exists() else {}
 except Exception:
     state = {}
+deliver = state.get("deliver") or {}
+# 优先级：探测到的第一个 → 旧 state.json 的 target（用户手动改过）
+target = (candidates[0] if candidates else None) or preserved or None
 state["deliver"] = {
     "target": target,
-    "auto_configured": True,
+    "auto_configured": bool(candidates) and target == (candidates[0] if candidates else None),
     "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "source": "install-hermes.sh auto-detect from ~/.hermes/config.yaml",
+    "source": "install-hermes.sh auto-detect (auth.json → config.yaml)",
+    "candidates": candidates,
 }
 Path(path).parent.mkdir(parents=True, exist_ok=True)
 Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-print(f"  → state.json deliver.target = {target}")
+print(f"  → state.json deliver.target = {target}  (candidates: {len(candidates)})")
 PY
-  info "通知投递已自动配置：target=$DETECTED_TARGET"
+
+if [ -n "$DETECTED_TARGET" ]; then
+  info "通知投递已自动配置：target=$DETECTED_TARGET（候选 ${CANDIDATES_COUNT} 个，写入 state.json.candidates）"
+elif [ -n "$PRESERVED_TARGET" ]; then
+  info "未检测到新 IM 平台，复用旧 deliver.target=$PRESERVED_TARGET"
 else
-  warn "未检测到 Hermes 已配置的 IM 平台（telegram/discord/...）"
-  warn "  → miloco 主动通知将无法送达。装完请："
-  warn "     1) 在 Hermes 里连一个 IM 平台（hermes config set telegram.bot_token ...）"
-  warn "     2) 手动编辑 ${PLUGIN_STATE}，加 deliver.target 字段，形如："
+  warn "未检测到 Hermes 已配置的 IM 平台（auth.json / config.yaml 都空）"
+  warn "  → miloco 主动通知将无法送达（miloco_im_push 会返回 no deliver target）。"
+  warn "  → 装完请二选一："
+  warn "     a) 在 Hermes 里连一个 IM（hermes config set telegram.bot_token ...）后重跑 install-hermes.sh"
+  warn "     b) 手动编辑 ${PLUGIN_STATE}，加 deliver.target 字段，形如："
   warn "        {\"deliver\": {\"target\": \"telegram\"}}"
 fi
+mark_done 4.5
 
 # --- 5. patch ${MILOCO_HOME}/config.json ---
-info "patch ${MILOCO_HOME}/config.json 的 agent 段..."
-TS="$(date +%Y%m%d-%H%M%S)"
+step 5 "patch ${MILOCO_HOME}/config.json 的 agent 段"
+# backup 文件名加 PID + 纳秒，避免 30s 内 reinstall 撞名
+TS="$(date +%Y%m%d-%H%M%S)-pid$$-nsec$(date +%N)"
 cp "$MILOCO_HOME/config.json" "${MILOCO_HOME}/config.json.bak-${TS}"
 "$PYTHON" - "$MILOCO_HOME" "$ADAPTER_PORT" "$BEARER" <<'PY'
 import json, sys
@@ -230,9 +343,10 @@ json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 print(f"  webhook_url = http://127.0.0.1:{port}/miloco/webhook")
 print(f"  auth_bearer = {bearer[:8]}...")
 PY
+mark_done 5
 
 # --- 6. patch ~/.hermes/.env（仅当缺失时追加）---
-info "确保 ${HERMES_HOME}/.env 有 API_SERVER_KEY..."
+step 6 "确保 ${HERMES_HOME}/.env 有 API_SERVER_KEY"
 touch "$HERMES_HOME/.env"
 chmod 600 "$HERMES_HOME/.env"
 if ! grep -q '^API_SERVER_KEY=' "$HERMES_HOME/.env" 2>/dev/null; then
@@ -241,8 +355,10 @@ if ! grep -q '^API_SERVER_KEY=' "$HERMES_HOME/.env" 2>/dev/null; then
 else
   warn ".env 已有 API_SERVER_KEY，保持原值"
 fi
+mark_done 6
 
 # --- 7. 重启 adapter ---
+step 7 "重启 adapter (端口 ${ADAPTER_PORT})"
 # 停旧的（Git Bash $! 在 Windows 下 ≠ Windows native PID，按端口反查兜底）
 if [ -f "$ADAPTER_PID" ]; then
   OLD_PID="$(cat "$ADAPTER_PID" 2>/dev/null || echo '')"
@@ -254,7 +370,7 @@ if [ -f "$ADAPTER_PID" ]; then
 fi
 
 # 启新的
-info "启动 adapter 进程（端口 ${ADAPTER_PORT}）..."
+info "  启动新进程..."
 ( cd "$HERMES_PLUGINS_DIR" \
   && PYTHONUTF8=1 \
      ADAPTER_AUTH_BEARER="$BEARER" \
@@ -265,28 +381,73 @@ info "启动 adapter 进程（端口 ${ADAPTER_PORT}）..."
      nohup "$PYTHON" -m adapter \
        > "$ADAPTER_LOG" 2>&1 & echo $! > "$ADAPTER_PID" )
 
-sleep 2
+# Retry loop：冷启动 adapter 可能要 import ~10s，最多等 20s，每 0.5s 查一次端口。
 # 关键：按端口反查 Windows native PID 覆盖写入 pid 文件（Git Bash $! 在 Windows 不可靠）
-WIN_PID="$(get_pid_by_port "$ADAPTER_PORT" | tr -d '\r\n ' || echo '')"
+WIN_PID=""
+for i in $(seq 1 40); do
+  sleep 0.5
+  WIN_PID="$(get_pid_by_port "$ADAPTER_PORT" | tr -d '\r\n ' || echo '')"
+  if [ -n "$WIN_PID" ]; then
+    break
+  fi
+  if [ $((i % 4)) -eq 0 ]; then
+    printf "  ...等待端口 (${i}/40, ${ADAPTER_PORT})\n"
+  fi
+done
 if [ -n "$WIN_PID" ]; then
   echo "$WIN_PID" > "$ADAPTER_PID"
-  info "adapter 已起，PID=${WIN_PID}（按端口反查）"
+  info "adapter 已起，PID=${WIN_PID}（端口 ${ADAPTER_PORT}，等了 ~$((i/2))s）"
 else
-  err "adapter 启动失败，端口 $ADAPTER_PORT 未监听，看 $ADAPTER_LOG 末尾："
+  err "adapter 启动失败，端口 $ADAPTER_PORT 未监听（等了 20s）。看 $ADAPTER_LOG 末尾："
   tail -20 "$ADAPTER_LOG" >&2 || true
   exit 1
 fi
+mark_done 7
 
-# --- 8. 终态 ---
+# --- 8. enable plugin（Hermes 是 opt-in，不 enable 就不会加载工具）---
+step 8 "enable Hermes 插件 miloco"
+# plugin.yaml 里的 name 字段是 'miloco'，enable 时用它
+if command -v hermes >/dev/null 2>&1; then
+  # 已 enabled 跳过；未 enabled 才 enable
+  if hermes plugins list 2>/dev/null | grep -E "miloco.*enabled" >/dev/null 2>&1; then
+    info "  已是 enabled，跳过"
+  else
+    if hermes plugins enable miloco >/dev/null 2>&1; then
+      info "  已 enable"
+    else
+      warn "  hermes plugins enable miloco 失败（可能是 hermes gateway 未启动或 CLI 版本不一致）"
+      warn "  → 装完手动跑：hermes plugins enable miloco"
+    fi
+  fi
+  # 可见性证据：echo 当前 enabled 行
+  echo "  当前插件状态："
+  hermes plugins list 2>/dev/null | sed 's/^/    /' || true
+else
+  warn "找不到 hermes CLI，跳过 enable（装完手动跑 hermes plugins enable miloco）"
+fi
+mark_done 8
+
+# --- 终态 ---
 cat <<EOF
 
 ============================================================
  ✅ 安装完成（可重复执行，幂等）
 ============================================================
 
-[后续你只要做这一件事] 重启 Hermes gateway 让插件和新配置生效：
-    hermes gateway restart
-    （或 hermes gateway stop && hermes gateway start）
+EOF
+
+# ⚠️ 醒目 banner：必须由用户自己跑 gateway restart（Hermes anti-restart-loop）
+echo -e "${Y}============================================================${N}"
+echo -e "${Y} ⚠️  现在请你自己终端跑（不要让 agent 代跑）：${N}"
+echo -e "${Y}     hermes gateway restart${N}"
+echo -e "${Y}     （或 hermes gateway stop && hermes gateway start）${N}"
+echo -e "${Y} 原因：Hermes anti-restart-loop 会拒绝在 gateway 进程内重启${N}"
+echo -e "${Y}============================================================${N}"
+echo
+
+cat <<EOF
+[插件状态]
+    上面 hermes plugins list 输出会确认 miloco 是 enabled
 
 [试一下]
     hermes chat -q "把客厅灯打开" -Q
@@ -300,6 +461,7 @@ cat <<EOF
 [配置文件位置]
     $MILOCO_HOME/config.json   # miloco 后端配置（已 patch）
     $HERMES_HOME/.env          # Hermes 环境（已追加 API_SERVER_KEY）
+    $PLUGIN_STATE              # 插件 deliver.target
     $ADAPTER_PID               # adapter PID
     $ADAPTER_LOG               # adapter 日志
 
@@ -307,6 +469,7 @@ cat <<EOF
     ${MILOCO_HOME}/config.json.bak-${TS}  是 patch 前的备份
     $HERMES_HOME/.env 里去掉 API_SERVER_KEY 即可
     卸插件：rm -rf $HERMES_PLUGINS_DIR $HERMES_HOME/skills/miloco-*
+    disable 插件：hermes plugins disable miloco
 
 [详细文档] $HERE/README.md
 ============================================================
