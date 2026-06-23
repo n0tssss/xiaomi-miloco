@@ -1,0 +1,114 @@
+"""3 个 hermes-reported bug 的防回归测试。
+
+- Issue 2: $LAUNCHD_LOG 用了未定义变量 → 改成 $ADAPTER_LOG
+- Issue 1: 半装残留检测（supervisord.sock 残留 / stale pid / config.json 缺失）
+- Issue 3: IM 探测扩视野（env vars + auth.json 顶层 + XDG 路径）
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+INSTALL_SH = Path(__file__).resolve().parent.parent / "install-hermes.sh"
+ADAPTER_SH = Path(__file__).resolve().parent.parent / "scripts" / "miloco-adapter.sh"
+
+
+# ─── Issue 2: $LAUNCHD_LOG typo ──────────────────────────────────────
+
+
+def test_no_undefined_launchd_log_variable():
+    """$LAUNCHD_LOG 是 typo（变量从未定义），必须不存在。"""
+    text = ADAPTER_SH.read_text(encoding="utf-8")
+    assert "$LAUNCHD_LOG" not in text, (
+        "miloco-adapter.sh 还在用 $LAUNCHD_LOG（未定义变量，set -u 会崩）"
+    )
+    assert "${LAUNCHD_LOG}" not in text
+
+
+def test_adapter_uses_correct_log_variable():
+    """正确的日志变量是 $ADAPTER_LOG（line 27 定义）。"""
+    text = ADAPTER_SH.read_text(encoding="utf-8")
+    assert "ADAPTER_LOG=\"$HERMES_HOME/miloco-adapter.log\"" in text
+    # 错误分支打印日志路径时用 $ADAPTER_LOG
+    assert "${ADAPTER_LOG}" in text
+
+
+# ─── Issue 1: 半装残留检测 ────────────────────────────────────────
+
+
+def test_install_step_1_6_detects_supervisord_sock_residue():
+    """Step 1.6 必须检测 supervisord.sock 残留（无 conf 但有 sock）。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    # 新增的 1.6 块位于 # --- 1.6 注释和 mark_done 1 之间
+    step16 = text.split("# --- 1.6")[1].split("mark_done 1")[0]
+    assert "SUPERVISORD_SOCK" in step16 or "supervisord.sock" in step16
+    assert "半装残留" in step16
+
+
+def test_install_step_1_6_detects_stale_pid():
+    """Step 1.6 必须检测 stale pid（pid 文件存在但进程已死）。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    step16 = text.split("# --- 1.6")[1].split("mark_done 1")[0]
+    assert "stale" in step16.lower() or "stale pid" in step16
+
+
+def test_install_step_1_6_detects_missing_config_json():
+    """Step 1.6 必须检测 config.json 缺失。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "config.json 缺失" in text or "config.json: not found" in text.lower()
+
+
+def test_install_step_1_6_does_not_kill_supervisord_silently():
+    """半装残留检测不擅自 kill supervisord（可能管着别的服务）。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    step16 = text.split("# --- 1.6")[1].split("mark_done 1")[0]
+    # 找包含 supervisord 的行（排除注释行）
+    for line in step16.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if "supervisord" in line and "kill" in line.lower():
+            pytest.fail(f"半装残留不该自动 kill supervisord: {line!r}")
+
+
+# ─── Issue 3: IM 探测扩视野 ────────────────────────────────────────
+
+
+def test_install_im_detection_checks_auth_json_providers():
+    """IM 探测必须读 auth.json::providers（原有）。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert 'auth_cfg.get("providers")' in text
+
+
+def test_install_im_detection_checks_auth_json_top_level():
+    """IM 探测必须读 auth.json 顶层（旧 Hermes 版本可能不用 providers）。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "1.5) auth.json 顶层" in text
+
+
+def test_install_im_detection_checks_env_vars():
+    """IM 探测必须读环境变量（FEISHU_APP_ID / TELEGRAM_BOT_TOKEN / ...）。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "ENV_VARS" in text
+    assert "TELEGRAM_BOT_TOKEN" in text
+    assert "FEISHU_APP_ID" in text
+    assert "WEIXIN_APP_ID" in text
+    assert "os.environ.get" in text
+
+
+def test_install_im_detection_checks_xdg_path():
+    """IM 探测必须读 XDG 备用路径 ~/.config/hermes/auth.json。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert ".config" in text
+    assert "hermes" in text
+    assert "alt_auth" in text or "备用" in text or "XDG" in text
+
+
+def test_install_im_detection_covers_all_mainstream_platforms_in_env():
+    """环境变量表必须覆盖主流 10+ 平台。"""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    env_block = text.split("ENV_VARS = {")[1].split("}")[0] if "ENV_VARS = {" in text else ""
+    for plat in ("telegram", "discord", "slack", "feishu", "wecom", "dingtalk", "weixin", "qqbot", "whatsapp"):
+        assert plat in env_block, f"ENV_VARS 缺 {plat} 平台"

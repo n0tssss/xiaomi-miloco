@@ -350,6 +350,36 @@ if [ "$NO_START_BACKEND" -eq 0 ]; then
     fi
   fi
 fi
+
+# --- 1.6 半装残留检测 + 清理（upstream --agent-prepare 异常退出时可能留下） ---
+# 现象：supervisord 进程在跑但 supervisord.conf 已被删（半装态）。
+# 后果：miloco service status 永远说"在跑"，但实际接不上 / 行为异常。
+# 修法：检测到这种状态就 warn + 提示用户怎么清理，**不**擅自 kill supervisord（它可能管着别的服务）。
+if [ -d "$MILOCO_HOME" ]; then
+  SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
+  SUPERVISORD_PID="$MILOCO_HOME/supervisord.pid"
+  SUPERVISORD_SOCK="$MILOCO_HOME/supervisord.sock"
+  # 情况 1: supervisord.conf 缺失但 PID 还在
+  if [ ! -f "$SUPERVISORD_CONF" ] && [ -f "$SUPERVISORD_SOCK" ]; then
+    warn "半装残留：supervisord.sock 存在但 supervisord.conf 缺失"
+    warn "  这通常是上次 --agent-prepare 异常退出留下的"
+    warn "  修复：miloco-cli service stop  或  supervisord -c /dev/null shutdown"
+  fi
+  # 情况 2: PID 文件存在但进程已死
+  if [ -f "$SUPERVISORD_PID" ]; then
+    OLD_SPID="$(cat "$SUPERVISORD_PID" 2>/dev/null | tr -d ' \r\n' || echo '')"
+    if [ -n "$OLD_SPID" ] && ! kill -0 "$OLD_SPID" 2>/dev/null; then
+      warn "半装残留：supervisord.pid 指向已死进程 $OLD_SPID"
+      rm -f "$SUPERVISORD_PID"
+      info "  已清理 stale pid 文件"
+    fi
+  fi
+  # 情况 3: config.json 缺失（upstream --agent-prepare 没成功或被误删）
+  if [ ! -f "$MILOCO_HOME/config.json" ]; then
+    warn "半装残留：config.json 缺失（upstream --agent-prepare 似乎没成功）"
+    warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+  fi
+fi
 mark_done 1
 
 # --- 2. 拿/复用 Bearer ---
@@ -463,6 +493,19 @@ if isinstance(providers, dict):
                 else:
                     found.append(plat)
 
+# 1.5) auth.json 顶层（旧版本 Hermes 平台状态可能直接挂在根，不是 providers 下）
+if not found:
+    for plat in CANDIDATES:
+        # 顶层 plat 段直接是真连接标志
+        top = auth_cfg.get(plat) if isinstance(auth_cfg, dict) else None
+        if isinstance(top, dict) and (top.get("connected") is True or top.get("status") == "connected"):
+            chat_id = top.get("chat_id") or top.get("home_chat_id") or ""
+            thread_id = top.get("thread_id") or ""
+            if chat_id:
+                found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
+            else:
+                found.append(plat)
+
 # 2) config.yaml 段（fallback；可能只是声明但未连）
 if not found:
     cfg_path = home / "config.yaml"
@@ -478,6 +521,48 @@ if not found:
             keys = TOKEN_KEYS.get(plat, ())
             if any(sec.get(k) for k in keys):
                 found.append(build_target(plat, sec))
+
+# 3) 环境变量（hermes 进程跑时 import 的，install 时也能读）
+# 平台 → 必现的环境变量名（任一存在即算"已配置"）
+ENV_VARS = {
+    "telegram":  ("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"),
+    "discord":   ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"),
+    "slack":     ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
+    "feishu":    ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_VERIFICATION_TOKEN"),
+    "wecom":     ("WECOM_CORP_ID", "WECOM_CORP_SECRET", "WECOM_AGENT_ID"),
+    "dingtalk":  ("DINGTALK_APP_KEY", "DINGTALK_APP_SECRET"),
+    "weixin":    ("WEIXIN_APP_ID", "WEIXIN_APP_SECRET", "WEIXIN_TOKEN"),
+    "qqbot":     ("QQBOT_APP_ID", "QQBOT_CLIENT_SECRET"),
+    "whatsapp":  ("WHATSAPP_PHONE_NUMBER", "WHATSAPP_ACCESS_TOKEN"),
+    "signal":    ("SIGNAL_PHONE_NUMBER",),
+    "mattermost":("MATTERMOST_URL", "MATTERMOST_TOKEN"),
+}
+if not found:
+    import os
+    for plat, vars_ in ENV_VARS.items():
+        if any(os.environ.get(v) for v in vars_):
+            # 没 chat_id 信息，只记 plat 名
+            found.append(plat)
+
+# 4) 备用 auth.json 路径（部分系统 XDG：~/.config/hermes/auth.json）
+if not found:
+    alt_auth = Path.home() / ".config" / "hermes" / "auth.json"
+    if alt_auth.is_file():
+        try:
+            alt_cfg = json.loads(alt_auth.read_text(encoding="utf-8")) or {}
+            alt_providers = alt_cfg.get("providers") if isinstance(alt_cfg, dict) else None
+            if isinstance(alt_providers, dict):
+                for plat in CANDIDATES:
+                    p = alt_providers.get(plat)
+                    if isinstance(p, dict) and (p.get("connected") is True or p.get("status") == "connected"):
+                        chat_id = p.get("chat_id") or p.get("home_chat_id") or ""
+                        thread_id = p.get("thread_id") or ""
+                        if chat_id:
+                            found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
+                        else:
+                            found.append(plat)
+        except Exception:
+            pass
 
 print(json.dumps(found, ensure_ascii=False), end="")
 PY
