@@ -13,11 +13,23 @@ bash plugins/hermes/install-hermes.sh
 hermes gateway restart
 ```
 
-The install script is idempotent: it copies the 16 miloco-\* skills to `~/.hermes/skills/`, copies the plugin + inbound adapter to `~/.hermes/plugins/miloco/`, auto-detects which IM platform you have configured in `~/.hermes/{auth.json,config.yaml}` and writes `deliver.target` into the plugin's `state.json`, patches `$MILOCO_HOME/config.json::agent` (auto-backup), writes `API_SERVER_KEY` to `~/.hermes/.env`, nohup-starts the adapter with PID + log at `~/.hermes/miloco-adapter.{pid,log}`, and runs `hermes plugins enable miloco` (idempotent). Re-running the script preserves the same Bearer and restarts the adapter.
+The install script is idempotent: it copies the 16 miloco-\* skills to `~/.hermes/skills/`, copies the plugin + inbound adapter to `~/.hermes/plugins/miloco/`, auto-detects which IM platform you have configured in `~/.hermes/{auth.json,config.yaml}` and writes `deliver.target` into the plugin's `state.json`, patches `$MILOCO_HOME/config.json::agent` (auto-backup, keep newest 3), writes `API_SERVER_KEY` to `~/.hermes/.env`, starts the adapter (PID + log at `~/.hermes/miloco-adapter.{pid,log}`), and runs `hermes plugins enable miloco` (idempotent). Re-running the script preserves the same Bearer and restarts the adapter.
 
-Adapter lifecycle: `bash plugins/hermes/scripts/miloco-adapter.sh {start|stop|restart|status|logs|env}`.
+**Adapter lifecycle**:
+- **macOS** — adapter runs as a `launchd` LaunchAgent (`~/Library/LaunchAgents/com.xiaomi.miloco.hermes.adapter.plist`); survives shell exit, reboots, re-installs.
+- **Linux / WSL** — adapter runs as a daemonized background process (`nohup` + `< /dev/null`, fully detached from install.sh's process group).
 
-For a step-by-step guide written for an AI agent to follow, see [scripts/install-guide-hermes.md](../../scripts/install-guide-hermes.md).
+Lifecycle wrapper: `bash plugins/hermes/scripts/miloco-adapter.sh {start|stop|restart|status|logs|env}`.
+
+For a step-by-step guide written for an AI agent to follow (covers pre-flight checks, OAuth + API-key user-terminal steps, and verification), see [scripts/install-guide-hermes.md](../../scripts/install-guide-hermes.md).
+
+> **Note:** the README's 3 commands install the fork, but you still need to do **3 user-terminal actions** that the agent cannot run for you (Hermes masks sensitive values + the gateway has an anti-restart-loop):
+>
+> 1. Bind your Xiaomi account — `miloco-cli account bind` (interactive; or browser OAuth + `miloco-cli account authorize "<base64>"`)
+> 2. Set the Omni model API key — `miloco-cli config set model.omni.api_key "<your-key>"`
+> 3. Restart Hermes gateway — `hermes gateway restart`
+>
+> Point Hermes at [scripts/install-guide-hermes.md](../../scripts/install-guide-hermes.md) and it will walk you through all three.
 
 ## What It Does
 
