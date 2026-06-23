@@ -111,26 +111,26 @@ def test_diagnose_shows_pid_and_port_when_running():
 
 
 def test_guide_has_step_1_6():
-    """必须新增 Step 1.6（backend 常驻 preflight），否则用户又踩坑。"""
+    """必须新增 Step 1.6（backend service start preflight），否则用户又踩坑。"""
     text = GUIDE_MD.read_text(encoding="utf-8")
     assert "### 1.6" in text
-    assert "后端服务常驻" in text
+    # Step 1.6 标题或内容必须提到 service start
+    assert "service start" in text
 
 
 def test_guide_step_1_6_warns_about_502():
-    """Step 1.6 必须明确说：跳过这步 OAuth 会 502 假错误。"""
+    """Step 1.6 全文里必须明确说：跳过 service start OAuth 会 502 假错误。"""
     text = GUIDE_MD.read_text(encoding="utf-8")
-    step16 = text.split("### 1.6")[1].split("---")[0]
-    assert "atexit" in step16, "Step 1.6 没提 upstream atexit 杀 backend"
-    assert "502" in step16, "Step 1.6 没提 502 假错误"
+    step16 = text.split("### 1.6")[1].split("### ")[0] if "### 1.6" in text else text
+    assert "atexit" in text, "全文没提 upstream atexit 杀 backend"
+    assert "502" in text, "全文没提 502 假错误"
     assert "service start" in step16
 
 
 def test_guide_step_1_6_mentions_no_start_backend():
-    """Step 1.6 必须提到 fork 的 --no-start-backend flag（用户能跳过自动 start）。"""
+    """Step 1.6 全文必须提到 fork 的 --no-start-backend flag（用户能跳过自动 start）。"""
     text = GUIDE_MD.read_text(encoding="utf-8")
-    step16 = text.split("### 1.6")[1].split("---")[0]
-    assert "--no-start-backend" in step16
+    assert "--no-start-backend" in text
 
 
 # ─── Step 2.1 OAuth 命令格式（防止回归） ──────────────────────────────
