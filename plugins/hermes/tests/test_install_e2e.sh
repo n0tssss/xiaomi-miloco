@@ -111,7 +111,7 @@ assert "16 个 skill 目录" "$([ $SKILL_DIRS -eq 16 ] && echo 1 || echo 0)"
 assert "pid 文件存在" "$T"
 PID1=$(cat "$HERMES_HOME/miloco-adapter.pid" 2>/dev/null)
 [ -n "$PID1" ] && T=1 || T=0
-assert "pid 非空（$PID1）" "$T"
+assert "pid 非空（${PID1}）" "$T"
 grep -q '^API_SERVER_KEY=' "$HERMES_HOME/.env" && T=1 || T=0
 assert ".env 包含 API_SERVER_KEY" "$T"
 grep -q '"webhook_url"' "$MILOCO_HOME/config.json" && T=1 || T=0
@@ -140,7 +140,7 @@ RC2=$?
 assert "幂等 exit 0" "$([ $RC2 -eq 0 ] && echo 1 || echo 0)"
 PID2=$(cat "$HERMES_HOME/miloco-adapter.pid" 2>/dev/null)
 [ "$PID1" != "$PID2" ] && [ -n "$PID2" ] && T=1 || T=0
-assert "PID 变化（$PID1 → $PID2）" "$T"
+assert "PID 变化（${PID1} → ${PID2}）" "$T"
 BEARER2=$(grep '^API_SERVER_KEY=' "$HERMES_HOME/.env" | cut -d= -f2-)
 [ "$BEARER" = "$BEARER2" ] && T=1 || T=0
 assert "Bearer 复用" "$T"
@@ -155,7 +155,7 @@ RC3=$?
 assert "restart exit 0" "$([ $RC3 -eq 0 ] && echo 1 || echo 0)"
 PID3=$(cat "$HERMES_HOME/miloco-adapter.pid" 2>/dev/null)
 [ "$PID2" != "$PID3" ] && [ -n "$PID3" ] && T=1 || T=0
-assert "restart 后 PID 变化（$PID2 → $PID3）" "$T"
+assert "restart 后 PID 变化（${PID2} → ${PID3}）" "$T"
 bash "$ADAPTER_SH" stop > /tmp/stop.log 2>&1
 RC4=$?
 assert "stop exit 0" "$([ $RC4 -eq 0 ] && echo 1 || echo 0)"
@@ -171,7 +171,7 @@ RC5=$?
 assert "exit 0" "$([ $RC5 -eq 0 ] && echo 1 || echo 0)"
 PID4=$(cat "$HERMES_HOME/miloco-adapter.pid" 2>/dev/null)
 [ -n "$PID4" ] && T=1 || T=0
-assert "新 adapter 已起（PID=$PID4）" "$T"
+assert "新 adapter 已起（PID=${PID4}）" "$T"
 
 # --- 总结 ---
 echo ""

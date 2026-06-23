@@ -117,9 +117,12 @@ def test_adapter_start_delegates_to_launchd_on_macos():
 def test_adapter_stop_delegates_to_launchd_on_macos():
     text = ADAPTER_SH.read_text(encoding="utf-8")
     # cmd_stop 函数体里必须调 cmd_stop_launchd
-    stop_fn = re.search(r"cmd_stop\(\) \{[^}]*?^\}", text, re.MULTILINE | re.DOTALL)
-    assert stop_fn, "找不到 cmd_stop() 函数"
-    assert "cmd_stop_launchd" in stop_fn.group(0), "cmd_stop() 没调 cmd_stop_launchd"
+    # 用宽松匹配：从 `cmd_stop() {` 到下一个 `cmd_stop_launchd()` 函数定义前
+    start = text.find("cmd_stop() {")
+    fn_def = text.find("cmd_stop_launchd()")
+    assert start != -1 and fn_def != -1, "找不到 cmd_stop / cmd_stop_launchd"
+    body = text[start:fn_def]
+    assert "cmd_stop_launchd" in body, "cmd_stop() 没调 cmd_stop_launchd"
     assert "launchctl unload" in text
 
 
