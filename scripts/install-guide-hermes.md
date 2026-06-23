@@ -93,6 +93,30 @@ echo "已装 commit: $(git -C xiaomi-miloco rev-parse --short HEAD)"
 
 如果上面任何一条 exit ≠ 0，**把错误信息贴给用户**（包括命令 + returncode + stderr），然后参考底部故障排除表。不要自己瞎猜。
 
+### 1.6 后端服务常驻（关键！否则 Step 2 会 502）
+
+⚠️ **upstream `install.py` 注册了 `atexit.register(_stop_service)`**（line 1614 / 1663）：无论 install 成败，退出时都自动 `miloco-cli service stop`。这是上游设计哲学，不是 bug，但 fork 集成必须自己补一步。
+
+如果跳过这步，**Step 2.1 的 `miloco-cli account authorize` 会拿到连接被拒**——CLI 误把它报成 `"invalid JSON response: 502"`（实际没有 502 服务器可问，是 backend 没起）。
+
+```bash
+miloco-cli service start
+miloco-cli service status    # 期望 {"running": true}
+# 或直接 curl 健康检查：
+curl -sS http://127.0.0.1:1810/health   # 期望 {"status":"ok"}
+```
+
+如果这一步 `service start` 失败（比如 macOS 上 .pkg 没装 supervisord、或 systemd 没装），看错误自己排查；常见修：
+
+```bash
+# macOS：确认上游 .pkg 装到位
+ls /Applications/MiCo.app 2>/dev/null || ls /usr/local/bin/miloco-cli 2>/dev/null
+# 或重新跑上游装：
+curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare
+```
+
+> **fork 自动行为**：`bash plugins/hermes/install-hermes.sh` 在 Step 1 前置检查里会**自动调 `miloco-cli service start`** 把 backend 拉起来（upstream atexit 杀掉的我们再补）。如果你不想它自动启，传 `--no-start-backend`。
+
 ---
 
 ## Step 2: Ask — 收集用户配置（不跑脚本）

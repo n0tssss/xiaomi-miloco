@@ -23,16 +23,19 @@ export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 # --- CLI 参数解析（--diagnose / --reset-deliver） ---
 DIAGNOSE_ONLY=0
+NO_START_BACKEND=0
 for arg in "$@"; do
   case "$arg" in
     --diagnose) DIAGNOSE_ONLY=1 ;;
+    --no-start-backend) NO_START_BACKEND=1 ;;
     --help|-h)
       cat <<EOF
 用法：bash install-hermes.sh [options]
   （无参数）       完整安装（patch config / 写 .env / 复制 plugin / 启 adapter / enable plugin）
-  --diagnose    自检模式：跑 12 项检查输出 ✓/✗，不做任何修改
-  --reset-deliver 清空 state.json::deliver.target，强制重新探测 IM（搭配安装用）
-  -h, --help    显示本帮助
+  --diagnose         自检模式：跑 12 项检查输出 ✓/✗，不做任何修改
+  --no-start-backend 跳过自动 miloco-cli service start（upstream install 退出时 atexit 杀掉的）
+  --reset-deliver    清空 state.json::deliver.target，强制重新探测 IM（搭配安装用）
+  -h, --help         显示本帮助
 EOF
       exit 0
       ;;
@@ -176,9 +179,12 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
   if command -v miloco-cli >/dev/null 2>&1; then
     ML_OUT="$(miloco-cli service status 2>&1 || true)"
     if echo "$ML_OUT" | grep -qiE "running|active|ok|started"; then
-      diag "miloco backend 在跑" 1
+      # 提取 PID + 端口（如果有）
+      ML_PID="$(echo "$ML_OUT" | grep -oE 'pid[=:]?[ ]*[0-9]+' | grep -oE '[0-9]+' | head -1 || echo '')"
+      ML_PORT="$(echo "$ML_OUT" | grep -oE 'port[=:]?[ ]*[0-9]+' | grep -oE '[0-9]+' | head -1 || echo '1810')"
+      [ -n "$ML_PID" ] && diag "miloco backend 在跑" 1 "PID=$ML_PID 端口=$ML_PORT" || diag "miloco backend 在跑" 1
     else
-      diag "miloco backend 在跑" 0 "miloco-cli service start"
+      diag "miloco backend 在跑" 0 "upstream install 退出时 atexit 杀了 → miloco-cli service start（install-hermes.sh 会自动拉起，传 --no-start-backend 跳过）"
     fi
   else
     diag "miloco backend 在跑" 0 "miloco-cli 不在 PATH"
@@ -316,6 +322,33 @@ if [ ! -d "$HERMES_HOME" ]; then
 fi
 if [ ! -f "$MILOCO_HOME/config.json" ]; then
   err "找不到 ${MILOCO_HOME}/config.json，请确认 MILOCO_HOME 正确（或 export MILOCO_HOME=...）"; exit 1
+fi
+
+# 1.5 自动拉起 miloco backend（upstream install.py 注册了 atexit._stop_service，
+# 装完会停 backend；fork 集成必须自己再 service start，否则 Step 2 OAuth 会 502 假错误）
+# 用 --no-start-backend flag 可跳过（用户在外部管理 backend 时）
+if [ "$NO_START_BACKEND" -eq 0 ]; then
+  if miloco-cli service status 2>&1 | grep -qiE "running|active|ok|started"; then
+    info "miloco backend 已在跑"
+  else
+    info "miloco backend 未跑（upstream install 退出时 atexit 杀的），自动 service start"
+    if miloco-cli service start 2>&1 | tail -5; then
+      info "service start 成功，等 backend /health..."
+      for i in $(seq 1 30); do
+        sleep 1
+        if curl -fsS --max-time 2 http://127.0.0.1:1810/health >/dev/null 2>&1; then
+          info "backend 就绪（等了 ${i}s）"
+          break
+        fi
+        if [ "$i" = "30" ]; then
+          warn "30s 内 backend /health 未 200 — 继续装但后续 Step 可能挂（看 miloco-cli service logs）"
+        fi
+      done
+    else
+      warn "miloco-cli service start 失败 — 继续装但后续 Step 2 OAuth 一定会 502"
+      warn "手动修：miloco-cli service start  或  重跑上游：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+    fi
+  fi
 fi
 mark_done 1
 
