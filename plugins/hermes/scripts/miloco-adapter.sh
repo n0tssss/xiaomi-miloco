@@ -213,7 +213,7 @@ cmd_start_launchd() {
     echo "$pid" > "$ADAPTER_PID"
     info "adapter 已起，PID=${pid}（launchd 路径），日志=${ADAPTER_LOG}"
   else
-    err "launchd 加载成功但端口 $ADAPTER_PORT 60s 未监听，看 $LAUNCHD_LOG"
+    err "launchd 加载成功但端口 $ADAPTER_PORT 60s 未监听，看 ${ADAPTER_LOG}"
     launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
     exit 1
   fi
