@@ -159,7 +159,7 @@ cmd_start() {
   done
   if [ -n "$pid" ]; then
     [ "$pid" != "$(cat "$ADAPTER_PID" 2>/dev/null)" ] && echo "$pid" > "$ADAPTER_PID"
-    info "adapter 已起，PID=$pid（按端口反查），日志=$ADAPTER_LOG"
+    info "adapter 已起，PID=${pid}（按端口反查），日志=${ADAPTER_LOG}"
   else
     err "adapter 启动失败，端口 $ADAPTER_PORT 未监听（等了 60s）。看 $ADAPTER_LOG 末尾："
     tail -20 "$ADAPTER_LOG" >&2 || true
@@ -171,7 +171,7 @@ cmd_start() {
 # macOS launchd 路径的 start：写 plist + launchctl load
 cmd_start_launchd() {
   if [ ! -f "$PLIST_TEMPLATE" ]; then
-    err "找不到 plist 模板 $PLIST_TEMPLATE（fork 不完整？重 git pull）"; exit 1
+    err "找不到 plist 模板 ${PLIST_TEMPLATE}（fork 不完整？重 git pull）"; exit 1
   fi
   if [ ! -x "$LAUNCHER" ]; then
     chmod +x "$LAUNCHER" 2>/dev/null || true
@@ -179,7 +179,7 @@ cmd_start_launchd() {
 
   # 已加载就跳过
   if launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"; then
-    warn "launchd 已加载 $LAUNCHD_LABEL，跳过（restart 会先 unload）"
+    warn "launchd 已加载 ${LAUNCHD_LABEL}，跳过（restart 会先 unload）"
     cmd_status_launchd
     return 0
   fi
@@ -195,7 +195,7 @@ cmd_start_launchd() {
 
   # launchctl load -w：写入 + 立即拉起
   if launchctl load -w "$LAUNCHD_PLIST" 2>/dev/null; then
-    info "launchd 已加载 $LAUNCHD_LABEL，plist=$LAUNCHD_PLIST"
+    info "launchd 已加载 ${LAUNCHD_LABEL}，plist=${LAUNCHD_PLIST}"
   else
     err "launchctl load 失败，看 /var/log/com.apple.xpc.launchd/launchd.log"
     cat "$LAUNCHD_PLIST" >&2
@@ -211,7 +211,7 @@ cmd_start_launchd() {
   done
   if [ -n "$pid" ]; then
     echo "$pid" > "$ADAPTER_PID"
-    info "adapter 已起，PID=$pid（launchd 路径），日志=$ADAPTER_LOG"
+    info "adapter 已起，PID=${pid}（launchd 路径），日志=${ADAPTER_LOG}"
   else
     err "launchd 加载成功但端口 $ADAPTER_PORT 60s 未监听，看 $LAUNCHD_LOG"
     launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
@@ -237,7 +237,7 @@ cmd_stop() {
     rm -f "$ADAPTER_PID"
     return 0
   fi
-  info "停 adapter PID=$pid（按 PID + 按端口双兜底）"
+  info "停 adapter PID=${pid}（按 PID + 按端口双兜底）"
   kill_adapter "$pid" "$ADAPTER_PORT"
   rm -f "$ADAPTER_PID"
   info "已停"
@@ -272,13 +272,13 @@ cmd_status() {
   local port_pid
   port_pid="$(get_pid_by_port "$ADAPTER_PORT" | tr -d '\r\n ' || echo '')"
   if [ -n "$port_pid" ]; then
-    info "adapter 在跑，端口 PID=$port_pid（pid 文件记录的=$pid）"
+    info "adapter 在跑，端口 PID=${port_pid}（pid 文件记录的=${pid}）"
     [ "$port_pid" != "$pid" ] && [ -n "$port_pid" ] && echo "$port_pid" > "$ADAPTER_PID"
   elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     info "adapter 在跑，PID=$pid"
   else
     warn "adapter 未在跑"
-    [ -f "$ADAPTER_PID" ] && warn "（stale pid 文件：$pid）"
+    [ -f "$ADAPTER_PID" ] && warn "（stale pid 文件：${pid}）"
   fi
   # 健康检查
   local url="http://127.0.0.1:${ADAPTER_PORT}/health"

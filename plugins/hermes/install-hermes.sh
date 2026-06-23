@@ -547,7 +547,7 @@ print(f"  → state.json deliver.target = {target}  (candidates: {len(candidates
 PY
 
 if [ -n "$DETECTED_TARGET" ]; then
-  info "通知投递已自动配置：target=$DETECTED_TARGET（候选 ${CANDIDATES_COUNT} 个，写入 state.json.candidates）"
+  info "通知投递已自动配置：target=${DETECTED_TARGET}（候选 ${CANDIDATES_COUNT} 个，写入 state.json.candidates）"
 elif [ -n "$PRESERVED_TARGET" ]; then
   info "未检测到新 IM 平台，复用旧 deliver.target=$PRESERVED_TARGET"
 else
@@ -634,6 +634,41 @@ else
   warn "找不到 hermes CLI，跳过 enable（装完手动跑 hermes plugins enable miloco）"
 fi
 mark_done 8
+
+# --- 8.5 兜底清掉 hermes namespace disable 漏写 ---
+# upstream hermes plugins enable 用 manifest.name="miloco" discard disabled 集合，
+# 但 nested plugin key="miloco/miloco-plugin" 不会被清 → install 显示成功但 runtime 仍 disabled。
+# 这里手动从 ~/.hermes/config.yaml 删掉 miloco* 残留（幂等，no-op if 没残留）。
+# 边界：
+#   - 文件不存在 → 跳过（hermes 还没初始化）
+#   - PyYAML 没装 → 跳过（不影响主流程）
+#   - 解析失败 → 跳过（不致命，靠 step 9 versions 自检帮我们看到）
+"$PYTHON" - <<'PY' 2>/dev/null || true
+import sys
+try:
+    import yaml  # noqa
+except ImportError:
+    sys.exit(0)
+from pathlib import Path
+p = Path.home() / ".hermes" / "config.yaml"
+if not p.exists():
+    sys.exit(0)
+try:
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+except Exception:
+    sys.exit(0)
+plugins = data.get("plugins") or {}
+disabled = plugins.get("disabled") or []
+new_disabled = [d for d in disabled if not str(d).startswith("miloco")]
+if len(new_disabled) != len(disabled):
+    plugins["disabled"] = new_disabled
+    data["plugins"] = plugins
+    p.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    print(f"  ✓ 兜底清理 plugins.disabled：{disabled} → {new_disabled}")
+else:
+    print(f"  · plugins.disabled 无 miloco 残留，无需清理")
+PY
+mark_done 8.5
 
 # --- 9. 记录版本到 state.json（升级一致性检查用） ---
 step 9 "记录版本到 plugin state.json"
