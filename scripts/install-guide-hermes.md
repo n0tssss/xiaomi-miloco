@@ -119,68 +119,54 @@ curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/inst
 
 ---
 
-## Step 2: Ask — 收集用户配置（不跑脚本）
+## Step 2: 引导用户完成 3 个敏感配置（agent 把命令贴出去就完事）
 
-**目标：** 根据 Step 1 输出的状态，**逐项**询问用户是否需要配置米家账号和模型。**禁止同时询问两项**，否则用户输入无法区分对应哪个配置。
+> **机制**：Hermes chat 自动 mask 敏感值（OAuth 码 / API key），agent 看不到也代跑不了。
+> **所以这一步 agent 只做一件事**：把命令贴给用户，让用户自己在终端跑。跑完用户回一句话。
 
-> **重要：Hermes chat 层面会自动 mask 敏感字符串**（base64 OAuth 授权码、`sk-xxx` API key 等）——agent 看不到明文也代跑不了。所以下列 3 类操作必须让用户在自己终端里跑：① 小米账号 OAuth 授权 ② 模型 API key 填入 ③ `hermes gateway restart`（Hermes anti-restart-loop 也会拒）。
-
-### 2.1 米家账号
-
-根据 `account.is_bound`：
+### 2.1 米家账号（按状态贴对应消息）
 
 **已绑定：**
 
-> 当前已绑定米家账号：{account.user}
-> 是否继续使用当前账号？还是重新绑定？
+> 当前已绑定米家账号：{account.user}，继续用它。直接说"继续绑"我就接着配模型。
 
-- 继续使用 → Step 3 不传 `--account-auth`
-- 重新绑定 → 给用户 `account.bind_url`，等用户完成授权后提供授权码
+**未绑定：**（把下面整段原样贴给用户，不多问）
 
-**未绑定：**
-
-> Miloco 需要绑定小米账号才能控制智能设备。
-> 请在浏览器中打开以下链接完成授权：
+> 打开浏览器授权小米账号：
 >
 > {account.bind_url}
 >
-> 完成后，请打开**你自己的终端**跑：
+> 授权完浏览器跳到 mico.api.mijia.tech/login_redirect，URL 里 `code=` 后面那串 base64 复制下来。
+> 立刻**你自己终端**跑（base64 5 分钟过期）：
 >
 > ```bash
 > miloco-cli account authorize <粘进去的 base64 码>
 > ```
 >
-> 授权码有效期只有几分钟，浏览器拿到 → 立刻粘到终端跑一气呵成。跑完告诉 agent「绑好了」。
+> 跑完告诉我「绑好了」，我接着配模型。
 
-### 2.2 Omni 模型配置
-
-根据 `model.configured`：
+### 2.2 Omni 模型（按状态贴对应消息）
 
 **已配置：**
 
-> 当前模型配置：
->
-> - Model: {model.model}
-> - Base URL: {model.base_url}
-> - API Key: {model.api_key_masked}
->
-> 是否沿用当前配置？还是使用新的模型服务？
+> 模型已配：{model.model} @ {model.base_url}，继续用它。直接说"继续配"我就接着装插件。
 
-- 沿用 → Step 3 不传模型参数
-- 重新配置 → 收集新的 API Key（及可选的 model/base_url）
+**未配置：**（把下面整段原样贴给用户，不多问）
 
-**未配置：**
-
-> Miloco 的感知引擎需要一个多模态大模型（Omni Model）来理解摄像头画面。
-> 默认推荐 **小米 MiMo** 模型。
+> 感知引擎需要 Omni 模型 key。默认用 **小米 MiMo**，key 从 https://platform.xiaomimimo.com 拿。
 >
-> 请打开**你自己的终端**跑：
+> 你自己终端跑：
 >
 > ```bash
-> miloco-cli config set model.omni.api_key "<你的_MiMo_Key>"
+> miloco-cli config set model.omni.api_key <你的_MiMo_Key>
 > ```
 >
-> 从 https://platform.xiaomimimo.com 拿 key。key 走 `miloco-cli config set` 不会被 mask，存到 `~/.openclaw/miloco/config.json` 是文件落盘。
+> key 走这个命令不被 mask，落到 `~/.openclaw/miloco/config.json` 文件里。
+> 跑完告诉我「配好了」，我接着装插件。
+
+### 2.3 用户回话后
+
+收到「绑好了」/「配好了」/「继续绑」/「继续配」中的任意一句，**直接进入 Step 3**，不再问。
 
 ---
 
