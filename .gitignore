@@ -79,8 +79,3 @@ openspec
 _workspace
 _local/
 xaf/
-
-# Local dev artifacts (not part of upstream or hermes work)
-.omc/
-fpk/
-web_ui/
