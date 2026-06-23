@@ -202,19 +202,36 @@ cmd_start_launchd() {
     exit 1
   fi
 
-  # 等端口（launchd 拉起 wrapper → wrapper exec python → 绑定端口）
+  # 等三件事齐全才算"起来了"：
+  #   1) PID 文件被 wrapper 写出（launchd 拉起 wrapper → wrapper echo $$ > pid）
+  #   2) 那个 PID 进程真活着（kill -0 成功）
+  #   3) /health 返 200（端口真的绑了）
+  #
+  # 之前用 lsof 反查端口在 launchd 子进程上不可靠（macOS 上 lsof 偶发拿不到
+  # launchd-managed 子进程的 socket → 误判失败 → 走 unload bootout 把刚拉起的
+  # adapter 干掉了）。改成 PID 文件 + health 双确认，绕开 lsof。
   local pid="" i
   for i in $(seq 1 120); do
     sleep 0.5
-    pid="$(get_pid_by_port "$ADAPTER_PORT" | tr -d '\r\n ' || echo '')"
-    if [ -n "$pid" ]; then break; fi
+    if [ -f "$ADAPTER_PID" ]; then
+      pid="$(cat "$ADAPTER_PID" 2>/dev/null | tr -d ' \r\n' || echo '')"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        # PID 文件 + 进程活，最后用 /health 确认端口真的起接了
+        if command -v curl >/dev/null 2>&1 \
+           && curl -fsS --max-time 2 "http://127.0.0.1:${ADAPTER_PORT}/health" >/dev/null 2>&1; then
+          break
+        fi
+      fi
+    fi
   done
-  if [ -n "$pid" ]; then
-    echo "$pid" > "$ADAPTER_PID"
-    info "adapter 已起，PID=${pid}（launchd 路径），日志=${ADAPTER_LOG}"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    info "adapter 已起，PID=${pid}（launchd 路径，PID 文件确认），日志=${ADAPTER_LOG}"
   else
-    err "launchd 加载成功但端口 $ADAPTER_PORT 60s 未监听，看 ${ADAPTER_LOG}"
+    err "launchd 加载成功但 60s 内 PID 文件未写出 / 进程未活 / /health 不通"
+    err "看 ${ADAPTER_LOG} 末尾："
+    tail -20 "$ADAPTER_LOG" >&2 || true
     launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+    rm -f "$ADAPTER_PID"
     exit 1
   fi
 }
