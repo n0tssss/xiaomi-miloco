@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Dict
 
@@ -146,8 +147,38 @@ def test_versions_missing_when_state_empty(tmp_path: Path):
     assert "没记录 versions" in out["error"]
 
 
-def test_versions_match(tmp_path: Path):
-    """state.json::versions 与当前一致 → ok=True，无 mismatches。"""
+@pytest.mark.skipif(
+    shutil.which("hermes") is None,
+    reason="hermes CLI 不在 PATH（无法对比版本号），跳过测试",
+)
+def test_versions_match(tmp_path: Path, monkeypatch):
+    """state.json::versions 与当前一致 → ok=True，无 mismatches。
+
+    _check_versions 会调 ``hermes --version`` 和 ``miloco-cli --version`` 拿
+    当前版本对比。Windows 上 hermes / miloco-cli 不在 PATH 时调 subprocess
+    会 FileNotFoundError，被 _check_versions 兜底成 ``err:...`` 字串 → 算
+    mismatch。本测试是单元测试不依赖外部 CLI：手工 monkeypatch subprocess.run
+    让它返稳定的版本字符串（state.json 里的值），保证 hermes 和 miloco-cli
+    字段一致 → mismatches == []。
+    """
+    # monkeypatch subprocess.run: hermes --version 和 miloco-cli --version 都返预期值
+    class _FakeProc:
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    _FAKE_OUTPUTS = {
+        ("hermes", "--version"): "Hermes Agent v0.10.0 (2026.4.16)",
+        ("miloco-cli", "--version"): "miloco-cli 1.2.3",
+    }
+
+    def fake_run(cmd, *args, **kwargs):
+        key = tuple(cmd[:2])
+        return _FakeProc(stdout=_FAKE_OUTPUTS.get(key, ""))
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
     import yaml as _y
     plugin_yaml = tmp_path / "plugin.yaml"
     plugin_yaml.write_text("version: 0.4.0\n", encoding="utf-8")
@@ -163,7 +194,7 @@ def test_versions_match(tmp_path: Path):
     ctx = _FakeCtx(tmp_path)
     out = ts._check_versions(ctx)
     # 不强求 ok=True（因为 hermes/miloco-cli 真实命令可能不在 PATH），但 mismatches 应为空
-    assert out["mismatches"] == []
+    assert out["mismatches"] == [], f"mismatches 不应非空: {out['mismatches']}"
     assert out["recorded"]["plugin"] == "0.4.0"
 
 
