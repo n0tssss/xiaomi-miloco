@@ -186,10 +186,16 @@ def _check_versions(ctx: Any) -> Dict[str, Any]:
     cur_miloco = "unknown"
     if shutil.which("miloco-cli"):
         try:
-            r = subprocess.run(["miloco-cli", "--version"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(["miloco-cli", "version"], capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
-                lines = (r.stdout or r.stderr or "").strip().splitlines()
-                cur_miloco = lines[0] if lines else "empty-output"
+                raw = (r.stdout or r.stderr or "").strip()
+                # miloco-cli version 输出形如 {"version": "2026.6.18"}，提取 version 字段做归一
+                try:
+                    import json as _json
+                    parsed = _json.loads(raw) if raw.startswith("{") else None
+                    cur_miloco = parsed.get("version") if isinstance(parsed, dict) else (raw.splitlines()[0] if raw else "empty-output")
+                except Exception:
+                    cur_miloco = raw.splitlines()[0] if raw else "empty-output"
             else:
                 cur_miloco = f"err:{r.returncode}"
         except Exception as exc:  # noqa: BLE001

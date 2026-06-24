@@ -169,7 +169,7 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
 
   # 3. miloco-cli
   if command -v miloco-cli >/dev/null 2>&1; then
-    MILOCO_VER="$("$PY" -c 'import subprocess; r=subprocess.run(["miloco-cli","--version"],capture_output=True,text=True,timeout=5); print(r.stdout.strip()[:60])' 2>/dev/null || echo unknown)"
+    MILOCO_VER="$("$PY" -c 'import subprocess,json; r=subprocess.run(["miloco-cli","version"],capture_output=True,text=True,timeout=5); v=(json.loads(r.stdout).get("version") if r.stdout.strip().startswith("{") else r.stdout.strip()); print(v)' 2>/dev/null || echo unknown)"
     diag "miloco-cli 在 PATH" 1 "$MILOCO_VER"
   else
     diag "miloco-cli 在 PATH" 0 "上游装：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
@@ -709,7 +709,7 @@ mark_done 8.5
 # --- 9. 记录版本到 state.json（升级一致性检查用） ---
 step 9 "记录版本到 plugin state.json"
 HERMES_VER="$(command -v hermes >/dev/null 2>&1 && hermes --version 2>&1 | head -1 || echo unknown)"
-MILOCO_VER="$(command -v miloco-cli >/dev/null 2>&1 && miloco-cli --version 2>&1 | head -1 || echo unknown)"
+MILOCO_VER="$(command -v miloco-cli >/dev/null 2>&1 && (miloco-cli version 2>/dev/null | python3 -c 'import sys,json; line=sys.stdin.read().strip(); print(json.loads(line).get("version","") if line.startswith("{") else line)' 2>/dev/null) || echo unknown)"
 PLUGIN_VER="$(grep '^version:' "$HERMES_PLUGINS_DIR/miloco-plugin/plugin.yaml" 2>/dev/null | awk '{print $2}' || echo unknown)"
 GIT_COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
