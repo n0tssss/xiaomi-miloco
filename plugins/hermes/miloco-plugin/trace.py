@@ -204,6 +204,7 @@ def _reduce_meta(buffer: List[Dict[str, Any]]) -> Dict[str, Any]:
         pl = ev.get("payload") or {}
         if hook == "post_llm_call":
             llm_call_count += 1
+            # 落盘字段名是 camelCase durationMs（保持和 OpenClaw trace.ts schema 一致）
             d = pl.get("durationMs")
             if isinstance(d, (int, float)):
                 llm_total_ms += int(d)
@@ -297,11 +298,12 @@ def _hk_pre_llm_call(session_id, user_message, conversation_history, is_first_tu
 def _hk_post_llm_call(session_id, user_message, assistant_response, conversation_history, model, platform, **kwargs):
     """对齐 llm_output + model_call_ended——同一 hook 记完整体 turn。"""
     run_id = _run_id_from_args(session_id=session_id, task_id=kwargs.get("task_id"))
+    # Hermes hook emit 用 snake_case duration_ms（不是 camelCase durationMs）
     _record(run_id, "post_llm_call", {
         "model": model,
         "platform": platform,
         "assistantLen": len(assistant_response or ""),
-        "durationMs": kwargs.get("durationMs", 0),  # Hermes 不一定给；0 表示未知
+        "durationMs": kwargs.get("duration_ms", 0),  # 落盘字段名保留 camelCase 兼容老 reader
     })
 
 
@@ -327,7 +329,7 @@ def _hk_post_tool_call(tool_name, args, result, task_id, **kwargs):
     _record(run_id, "post_tool_call", {
         "toolName": tool_name,
         "resultLen": len(result or ""),
-        "durationMs": kwargs.get("durationMs", 0),
+        "durationMs": kwargs.get("duration_ms", 0),  # Hermes 用 snake_case emit
         "error": error,
     })
 

@@ -241,13 +241,13 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
     if launchctl list 2>/dev/null | grep -q "com.xiaomi.miloco.hermes.adapter"; then
       diag "adapter (launchd)" 1 "已加载 com.xiaomi.miloco.hermes.adapter"
     else
-      diag "adapter (launchd)" 0 "未加载 → bash plugins/hermes/scripts/miloco-adapter.sh start"
+      diag "adapter (launchd)" 0 "未加载 → bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh start"
     fi
   elif get_pid_by_port "$ADAPTER_PORT" >/dev/null 2>&1 && [ -n "$(get_pid_by_port "$ADAPTER_PORT" | tr -d ' \r\n')" ]; then
     ADAPTER_PID_VAL="$(get_pid_by_port "$ADAPTER_PORT" | tr -d ' \r\n' | head -1)"
     diag "adapter 进程 (端口 $ADAPTER_PORT)" 1 "PID=$ADAPTER_PID_VAL"
   else
-    diag "adapter 进程" 0 "bash plugins/hermes/scripts/miloco-adapter.sh start"
+    diag "adapter 进程" 0 "bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh start"
   fi
 
   # 11. adapter /health
@@ -416,19 +416,30 @@ find "$HERMES_PLUGINS_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>
 
 # adapter-launcher.sh 要可执行（macOS launchd plist 调它）
 chmod +x "$HERE/scripts/adapter-launcher.sh" 2>/dev/null || true
+
+# 把 adapter 启停脚本复制到 plugins/ 下（agent / 自检工具按固定路径找）
+# 之前只 chmod 不复制，导致 miloco_status fix 提示的 `bash plugins/hermes/scripts/miloco-adapter.sh start`
+# 在用户 cwd 不是 fork 根目录时找不到。复到 ~/.hermes/plugins/miloco/ 下后绝对路径稳定。
+info "  复制 miloco-adapter.sh（adapter 启停 wrapper）"
+mkdir -p "$HERMES_PLUGINS_DIR/scripts"
+cp -f "$HERE/scripts/miloco-adapter.sh" "$HERMES_PLUGINS_DIR/scripts/miloco-adapter.sh"
+chmod +x "$HERMES_PLUGINS_DIR/scripts/miloco-adapter.sh"
 mark_done 4
 
 # --- 4.5 自动探测 Hermes 已配置的 IM 平台，写入插件 state.json ---
 step 4.5 "探测 IM 平台 → 写 plugin state.json::deliver.target"
 # 让 miloco_im_push 在 cron 场景下也能直接投递，不需要 LLM 在 cron session 里
 # 完成"两段式 bind"（cron 没人可对话，原方案不可用）。
-# 探测顺序：
-#   1) ~/.hermes/auth.json 的 providers（真连接凭据，首选）
-#   2) ~/.hermes/config.yaml 里哪些 platform 有 bot_token/token（fallback）
+#
+# 探测顺序（用 Hermes 自己加载的 channel directory 作 source of truth）：
+#   1) ``hermes send --list --json`` —— Hermes 官方加载的 channel directory，
+#      跟运行时 hermes send 用同一份数据
+#   2) fallback：~/.hermes/auth.json / config.yaml / env vars / XDG auth.json
+#      （hermes CLI 不可用或 plugin 还没 enable 时走这条）
 # 候选 platform 顺序：国内用户优先 weixin / feishu / wecom / dingtalk / qqbot
 DETECTED_TARGETS_JSON="$(
   "$PYTHON" - "$HERMES_HOME" <<'PY'
-import json, sys
+import json, os, subprocess, sys
 from pathlib import Path
 try:
     import yaml
@@ -460,6 +471,15 @@ TOKEN_KEYS = {
 }
 
 
+def build_target_from_channel(plat, ch):
+    """把 channel directory 一条记录解析成 hermes send --to 的 target 串。"""
+    chat_id = ch.get("id") or ch.get("chat_id") or ""
+    if not chat_id:
+        return None
+    thread_id = ch.get("thread_id") or ""
+    return f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else "")
+
+
 def build_target(plat, sec):
     """把 platform 段解析成 send_message 的 target 串。"""
     hc = sec.get("home_channel") or {}
@@ -471,107 +491,157 @@ def build_target(plat, sec):
 
 
 found = []  # 保留所有候选，让 state.json.candidates 可见
+source = "none"
 
-# 1) auth.json providers（真实连接凭据；最权威）
-auth_path = home / "auth.json"
-auth_cfg = {}
-if auth_path.is_file():
+# 1) Hermes 官方 channel directory（跟 hermes send 运行时同一份 source of truth）
+# 仅在 hermes CLI 可用 + 用户至少跑过一次 gateway 时有数据
+hermes_bin = None
+for p in os.environ.get("PATH", "").split(os.pathsep):
+    candidate = Path(p) / "hermes"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        hermes_bin = str(candidate)
+        break
+
+if hermes_bin:
     try:
-        auth_cfg = json.loads(auth_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        auth_cfg = {}
-providers = auth_cfg.get("providers") if isinstance(auth_cfg, dict) else None
-if isinstance(providers, dict):
-    for plat in CANDIDATES:
-        p = providers.get(plat)
-        if isinstance(p, dict) and any(p.get(k) for k in ("connected", "status", "token", "bot_token", "app_id")):
-            if p.get("connected") is True or p.get("status") == "connected":
-                chat_id = p.get("chat_id") or p.get("home_chat_id") or ""
-                thread_id = p.get("thread_id") or ""
+        proc = subprocess.run(
+            [hermes_bin, "send", "--list", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            data = json.loads(proc.stdout)
+            platforms = data.get("platforms") or {}
+            # 按 CANDIDATES 顺序遍历，保证国内优先
+            for plat in CANDIDATES:
+                channels = platforms.get(plat) or []
+                for ch in channels:
+                    target = build_target_from_channel(plat, ch)
+                    if target:
+                        found.append(target)
+                        break  # 每平台只取第一个 channel（home channel）
+            if found:
+                source = "hermes send --list --json"
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        pass
+
+# 2) fallback：~/.hermes/auth.json 的 providers（真实连接凭据）
+if not found:
+    auth_path = home / "auth.json"
+    auth_cfg = {}
+    if auth_path.is_file():
+        try:
+            auth_cfg = json.loads(auth_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            auth_cfg = {}
+    providers = auth_cfg.get("providers") if isinstance(auth_cfg, dict) else None
+    if isinstance(providers, dict):
+        for plat in CANDIDATES:
+            p = providers.get(plat)
+            if isinstance(p, dict) and any(p.get(k) for k in ("connected", "status", "token", "bot_token", "app_id")):
+                if p.get("connected") is True or p.get("status") == "connected":
+                    chat_id = p.get("chat_id") or p.get("home_chat_id") or ""
+                    thread_id = p.get("thread_id") or ""
+                    if chat_id:
+                        found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
+                    else:
+                        found.append(plat)
+
+    # 2.5) auth.json 顶层（旧版本 Hermes 平台状态可能直接挂在根）
+    if not found:
+        for plat in CANDIDATES:
+            top = auth_cfg.get(plat) if isinstance(auth_cfg, dict) else None
+            if isinstance(top, dict) and (top.get("connected") is True or top.get("status") == "connected"):
+                chat_id = top.get("chat_id") or top.get("home_chat_id") or ""
+                thread_id = top.get("thread_id") or ""
                 if chat_id:
                     found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
                 else:
                     found.append(plat)
 
-# 1.5) auth.json 顶层（旧版本 Hermes 平台状态可能直接挂在根，不是 providers 下）
-if not found:
-    for plat in CANDIDATES:
-        # 顶层 plat 段直接是真连接标志
-        top = auth_cfg.get(plat) if isinstance(auth_cfg, dict) else None
-        if isinstance(top, dict) and (top.get("connected") is True or top.get("status") == "connected"):
-            chat_id = top.get("chat_id") or top.get("home_chat_id") or ""
-            thread_id = top.get("thread_id") or ""
-            if chat_id:
-                found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
-            else:
+    # 3) config.yaml 段（fallback；可能只是声明但未连）
+    if not found:
+        cfg_path = home / "config.yaml"
+        if cfg_path.is_file() and yaml is not None:
+            try:
+                cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                cfg = {}
+            for plat in CANDIDATES:
+                sec = cfg.get(plat)
+                if not isinstance(sec, dict):
+                    continue
+                keys = TOKEN_KEYS.get(plat, ())
+                if any(sec.get(k) for k in keys):
+                    found.append(build_target(plat, sec))
+
+    # 4) 环境变量（hermes 进程跑时 import 的，install 时也能读）
+    if not found:
+        ENV_VARS = {
+            "telegram":  ("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"),
+            "discord":   ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"),
+            "slack":     ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
+            "feishu":    ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_VERIFICATION_TOKEN"),
+            "wecom":     ("WECOM_CORP_ID", "WECOM_CORP_SECRET", "WECOM_AGENT_ID"),
+            "dingtalk":  ("DINGTALK_APP_KEY", "DINGTALK_APP_SECRET"),
+            "weixin":    ("WEIXIN_APP_ID", "WEIXIN_APP_SECRET", "WEIXIN_TOKEN"),
+            "qqbot":     ("QQBOT_APP_ID", "QQBOT_CLIENT_SECRET"),
+            "whatsapp":  ("WHATSAPP_PHONE_NUMBER", "WHATSAPP_ACCESS_TOKEN"),
+            "signal":    ("SIGNAL_PHONE_NUMBER",),
+            "mattermost":("MATTERMOST_URL", "MATTERMOST_TOKEN"),
+        }
+        for plat, vars_ in ENV_VARS.items():
+            if any(os.environ.get(v) for v in vars_):
                 found.append(plat)
 
-# 2) config.yaml 段（fallback；可能只是声明但未连）
-if not found:
-    cfg_path = home / "config.yaml"
-    if cfg_path.is_file() and yaml is not None:
-        try:
-            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-        except Exception:
-            cfg = {}
-        for plat in CANDIDATES:
-            sec = cfg.get(plat)
-            if not isinstance(sec, dict):
-                continue
-            keys = TOKEN_KEYS.get(plat, ())
-            if any(sec.get(k) for k in keys):
-                found.append(build_target(plat, sec))
+    # 5) XDG 备用 auth.json
+    if not found:
+        alt_auth = Path.home() / ".config" / "hermes" / "auth.json"
+        if alt_auth.is_file():
+            try:
+                alt_cfg = json.loads(alt_auth.read_text(encoding="utf-8")) or {}
+                alt_providers = alt_cfg.get("providers") if isinstance(alt_cfg, dict) else None
+                if isinstance(alt_providers, dict):
+                    for plat in CANDIDATES:
+                        p = alt_providers.get(plat)
+                        if isinstance(p, dict) and (p.get("connected") is True or p.get("status") == "connected"):
+                            chat_id = p.get("chat_id") or p.get("home_chat_id") or ""
+                            thread_id = p.get("thread_id") or ""
+                            if chat_id:
+                                found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
+                            else:
+                                found.append(plat)
+            except Exception:
+                pass
 
-# 3) 环境变量（hermes 进程跑时 import 的，install 时也能读）
-# 平台 → 必现的环境变量名（任一存在即算"已配置"）
-ENV_VARS = {
-    "telegram":  ("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"),
-    "discord":   ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"),
-    "slack":     ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
-    "feishu":    ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_VERIFICATION_TOKEN"),
-    "wecom":     ("WECOM_CORP_ID", "WECOM_CORP_SECRET", "WECOM_AGENT_ID"),
-    "dingtalk":  ("DINGTALK_APP_KEY", "DINGTALK_APP_SECRET"),
-    "weixin":    ("WEIXIN_APP_ID", "WEIXIN_APP_SECRET", "WEIXIN_TOKEN"),
-    "qqbot":     ("QQBOT_APP_ID", "QQBOT_CLIENT_SECRET"),
-    "whatsapp":  ("WHATSAPP_PHONE_NUMBER", "WHATSAPP_ACCESS_TOKEN"),
-    "signal":    ("SIGNAL_PHONE_NUMBER",),
-    "mattermost":("MATTERMOST_URL", "MATTERMOST_TOKEN"),
-}
-if not found:
-    import os
-    for plat, vars_ in ENV_VARS.items():
-        if any(os.environ.get(v) for v in vars_):
-            # 没 chat_id 信息，只记 plat 名
-            found.append(plat)
+    if found:
+        source = "auth.json / config.yaml / env vars (fallback)"
 
-# 4) 备用 auth.json 路径（部分系统 XDG：~/.config/hermes/auth.json）
-if not found:
-    alt_auth = Path.home() / ".config" / "hermes" / "auth.json"
-    if alt_auth.is_file():
-        try:
-            alt_cfg = json.loads(alt_auth.read_text(encoding="utf-8")) or {}
-            alt_providers = alt_cfg.get("providers") if isinstance(alt_cfg, dict) else None
-            if isinstance(alt_providers, dict):
-                for plat in CANDIDATES:
-                    p = alt_providers.get(plat)
-                    if isinstance(p, dict) and (p.get("connected") is True or p.get("status") == "connected"):
-                        chat_id = p.get("chat_id") or p.get("home_chat_id") or ""
-                        thread_id = p.get("thread_id") or ""
-                        if chat_id:
-                            found.append(f"{plat}:{chat_id}" + (f":{thread_id}" if thread_id else ""))
-                        else:
-                            found.append(plat)
-        except Exception:
-            pass
-
-print(json.dumps(found, ensure_ascii=False), end="")
+print(json.dumps({"targets": found, "source": source}, ensure_ascii=False), end="")
 PY
-)" || DETECTED_TARGETS_JSON='[]'
+)" || DETECTED_TARGETS_JSON='{"targets": [], "source": "detection failed"}'
 
-DETECTED_TARGET="$("$PYTHON" - "$DETECTED_TARGETS_JSON" <<'PY'
+# 拆 DETECTED_TARGETS_JSON → targets list + source string
+DETECTED_TARGETS_LIST="$("$PYTHON" - "$DETECTED_TARGETS_JSON" <<'PY'
+import json, sys
+print(json.dumps(json.loads(sys.argv[1]).get("targets") or []), end="")
+PY
+)"
+DETECT_SOURCE="$("$PYTHON" - "$DETECTED_TARGETS_JSON" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1]).get("source") or "unknown", end="")
+PY
+)"
+
+# 第一个 target（向后兼容 DETECTED_TARGET 老变量名）
+DETECTED_TARGET="$("$PYTHON" - "$DETECTED_TARGETS_LIST" <<'PY'
 import json, sys
 arr = json.loads(sys.argv[1])
 print(arr[0] if arr else "", end="")
+PY
+)"
+CANDIDATES_COUNT=$("$PYTHON" - "$DETECTED_TARGETS_LIST" <<'PY'
+import json, sys
+print(len(json.loads(sys.argv[1])), end="")
 PY
 )"
 
@@ -579,11 +649,6 @@ PY
 # 用 ctx.manifest.path / "state.json" 解析（manifest.path 指向 plugin dir）。
 # 写到外面的话 plugin 永远读不到 → miloco_im_push 永远报 no deliver target。
 PLUGIN_STATE="$HERMES_PLUGINS_DIR/miloco-plugin/state.json"
-CANDIDATES_COUNT=$("$PYTHON" - "$DETECTED_TARGETS_JSON" <<'PY'
-import json, sys
-print(len(json.loads(sys.argv[1])), end="")
-PY
-)
 
 # --- 4.6 升级保留旧 deliver.target（除非 --reset-deliver）---
 RESET_DELIVER=0
@@ -617,30 +682,34 @@ try:
 except Exception:
     state = {}
 deliver = state.get("deliver") or {}
-# 优先级：探测到的第一个 → 旧 state.json 的 target（用户手动改过）
-target = (candidates[0] if candidates else None) or preserved or None
-state["deliver"] = {
+# 优先级: candidates[0] -> preserved -> None
+target = candidates[0] if candidates else preserved or None
+auto_cfg = bool(candidates) and target == candidates[0]
+now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+deliver_block = {
     "target": target,
-    "auto_configured": bool(candidates) and target == (candidates[0] if candidates else None),
-    "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "source": "install-hermes.sh auto-detect (auth.json → config.yaml)",
+    "auto_configured": auto_cfg,
+    "configured_at": now_iso,
+    "source": "install-hermes.sh auto-detect",
     "candidates": candidates,
 }
+state["deliver"] = deliver_block
 Path(path).parent.mkdir(parents=True, exist_ok=True)
 Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-print(f"  → state.json deliver.target = {target}  (candidates: {len(candidates)})")
+note = "state.json deliver.target = " + str(target) + "  candidates: " + str(len(candidates))
+print(note)
 PY
 
 if [ -n "$DETECTED_TARGET" ]; then
-  info "通知投递已自动配置：target=${DETECTED_TARGET}（候选 ${CANDIDATES_COUNT} 个，写入 state.json.candidates）"
+  info "通知投递已自动配置 target=${DETECTED_TARGET} 候选 ${CANDIDATES_COUNT} 个 写入 state.json.candidates"
 elif [ -n "$PRESERVED_TARGET" ]; then
-  info "未检测到新 IM 平台，复用旧 deliver.target=$PRESERVED_TARGET"
+  info "未检测到新 IM 平台 复用旧 deliver.target=$PRESERVED_TARGET"
 else
-  warn "未检测到 Hermes 已配置的 IM 平台（auth.json / config.yaml 都空）"
-  warn "  → miloco 主动通知将无法送达（miloco_im_push 会返回 no deliver target）。"
-  warn "  → 装完请二选一："
-  warn "     a) 在 Hermes 里连一个 IM（hermes config set telegram.bot_token ...）后重跑 install-hermes.sh"
-  warn "     b) 手动编辑 ${PLUGIN_STATE}，加 deliver.target 字段，形如："
+  warn "未检测到 Hermes 已配置的 IM 平台 auth.json / config.yaml 都空"
+  warn "miloco 主动通知将无法送达 miloco_im_push 会返回 no deliver target"
+  warn "装完请二选一"
+  warn "a 在 Hermes 里连一个 IM hermes config set telegram.bot_token 后重跑 install-hermes.sh"
+  warn "b 手动编辑 ${PLUGIN_STATE} 加 deliver.target 字段 形如"
   warn "        {\"deliver\": {\"target\": \"telegram\"}}"
 fi
 mark_done 4.5
@@ -816,10 +885,10 @@ cat <<EOF
     hermes chat -q "把客厅灯打开" -Q
 
 [adapter 状态]
-    bash $HERE/scripts/miloco-adapter.sh status    # 看 PID / 端口
-    bash $HERE/scripts/miloco-adapter.sh logs      # tail 日志
-    bash $HERE/scripts/miloco-adapter.sh restart   # 重启
-    bash $HERE/scripts/miloco-adapter.sh stop      # 停
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh status    # 看 PID / 端口
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh logs      # tail 日志
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh restart   # 重启
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh stop      # 停
 
 [配置文件位置]
     $MILOCO_HOME/config.json   # miloco 后端配置（已 patch）
