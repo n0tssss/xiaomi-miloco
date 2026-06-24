@@ -139,12 +139,12 @@ def test_reduce_meta_counts_llm_and_tools():
     """reduce_meta 聚合 llm_call_count / tool_call_count / 错误 / 最慢 tool。"""
     # pre_llm_call + post_llm_call x 2 + pre/post_tool_call x 2
     tr._hk_pre_llm_call("sess-1", "hi", [], True, "m", "p")
-    tr._hk_post_llm_call("sess-1", "hi", "ans", [], "m", "p", durationMs=1000)
-    tr._hk_post_llm_call("sess-1", "hi2", "ans2", [], "m", "p", durationMs=2000)
+    tr._hk_post_llm_call("sess-1", "hi", "ans", [], "m", "p", duration_ms=1000)
+    tr._hk_post_llm_call("sess-1", "hi2", "ans2", [], "m", "p", duration_ms=2000)
     tr._hk_pre_tool_call("miloco_im_push", {"m": "x"}, "sess-1")
-    tr._hk_post_tool_call("miloco_im_push", {"m": "x"}, "ok", "sess-1", durationMs=300)
+    tr._hk_post_tool_call("miloco_im_push", {"m": "x"}, "ok", "sess-1", duration_ms=300)
     tr._hk_pre_tool_call("bad_tool", {}, "sess-1")
-    tr._hk_post_tool_call("bad_tool", {}, json.dumps({"error": "fail"}), "sess-1", durationMs=500)
+    tr._hk_post_tool_call("bad_tool", {}, json.dumps({"error": "fail"}), "sess-1", duration_ms=500)
 
     state = tr._turns["sess-1"]
     meta = tr._reduce_meta(state.buffer)
@@ -186,7 +186,7 @@ def test_session_end_with_trace_id_keeps_done_meta():
     """有 traceId 的 miloco turn → finalize，留 done meta 给 backend 拉。"""
     tr.register_trace_link("sess-1", "trace-abc")
     tr._hk_pre_llm_call("sess-1", "hi", [], True, "m", "p")
-    tr._hk_post_llm_call("sess-1", "hi", "ans", [], "m", "p", durationMs=500)
+    tr._hk_post_llm_call("sess-1", "hi", "ans", [], "m", "p", duration_ms=500)
     tr._hk_on_session_end("sess-1", True, False, "m", "p")
     state = tr._turns["sess-1"]
     assert state.done is not None
@@ -257,7 +257,7 @@ def test_flush_enabled_writes_jsonl_and_meta(monkeypatch):
     monkeypatch.setenv("MILOCO_TRACE_DEBUG", "1")
     tr.register_trace_link("sess-1", "trace-abc")
     tr._hk_pre_llm_call("sess-1", "[Mon Jun 18 14:32:11 2026] 你好", [], True, "m", "p")
-    tr._hk_post_tool_call("miloco_im_push", {}, "ok", "sess-1", durationMs=42)
+    tr._hk_post_tool_call("miloco_im_push", {}, "ok", "sess-1", duration_ms=42)
     tr._hk_on_session_end("sess-1", True, False, "m", "p")
 
     state = tr._turns["sess-1"]
