@@ -97,7 +97,9 @@ def _check_adapter_health() -> Dict[str, Any]:
             "ok": False,
             "url": url,
             "error": f"{type(exc).__name__}: {exc}",
-            "fix": f"bash plugins/hermes/scripts/miloco-adapter.sh start（看 ~/.hermes/miloco-adapter.log）",
+            # install-hermes.sh 会把 miloco-adapter.sh 复制到 ~/.hermes/plugins/miloco/scripts/
+            # 用绝对路径，避免依赖用户 cwd 是不是 fork 根
+            "fix": "bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh start（看 ~/.hermes/miloco-adapter.log）",
         }
 
 
@@ -132,7 +134,10 @@ def _check_cron_jobs() -> Dict[str, Any]:
         "ok": len(missing) == 0,
         "registered": miloco_jobs,
         "missing": missing,
-        "fix": "重跑 bash plugins/hermes/install-hermes.sh（脚本会 idempotent reconcile 4 个 cron）"
+        "fix": (
+            "在 fork 仓库根目录重跑 bash plugins/hermes/install-hermes.sh "
+            "（脚本会 idempotent reconcile 4 个 cron）"
+        )
         if missing
         else None,
     }
@@ -171,25 +176,42 @@ def _check_versions(ctx: Any) -> Dict[str, Any]:
     if shutil.which("hermes"):
         try:
             r = subprocess.run(["hermes", "--version"], capture_output=True, text=True, timeout=5)
-            cur_hermes = (r.stdout or r.stderr or "").strip().splitlines()[0] if r.returncode == 0 else f"err:{r.returncode}"
+            if r.returncode == 0:
+                lines = (r.stdout or r.stderr or "").strip().splitlines()
+                cur_hermes = lines[0] if lines else "empty-output"
+            else:
+                cur_hermes = f"err:{r.returncode}"
         except Exception as exc:  # noqa: BLE001
             cur_hermes = f"err:{exc}"
     cur_miloco = "unknown"
     if shutil.which("miloco-cli"):
         try:
             r = subprocess.run(["miloco-cli", "--version"], capture_output=True, text=True, timeout=5)
-            cur_miloco = (r.stdout or r.stderr or "").strip().splitlines()[0] if r.returncode == 0 else f"err:{r.returncode}"
+            if r.returncode == 0:
+                lines = (r.stdout or r.stderr or "").strip().splitlines()
+                cur_miloco = lines[0] if lines else "empty-output"
+            else:
+                cur_miloco = f"err:{r.returncode}"
         except Exception as exc:  # noqa: BLE001
             cur_miloco = f"err:{exc}"
     # plugin 版本（从装好的 plugin.yaml 读）
     try:
-        base = getattr(getattr(ctx, "manifest", None), "path", "")
-        plugin_yaml = Path(base) / "plugin.yaml" if base else None
+        import os as _os
+        manifest_base = getattr(getattr(ctx, "manifest", None), "path", "")
+        candidates = []
+        if manifest_base and Path(manifest_base).is_dir():
+            candidates.append(Path(manifest_base) / "plugin.yaml")
+        # 兜底：install-hermes.sh 的装入点（dev / pip 都落这）
+        hermes_home = Path(_os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        candidates.append(hermes_home / "plugins" / "miloco" / "miloco-plugin" / "plugin.yaml")
         cur_plugin = "unknown"
-        if plugin_yaml and plugin_yaml.is_file():
-            for line in plugin_yaml.read_text(encoding="utf-8").splitlines():
-                if line.startswith("version:"):
-                    cur_plugin = line.split(":", 1)[1].strip()
+        for plugin_yaml in candidates:
+            if plugin_yaml and plugin_yaml.is_file():
+                for line in plugin_yaml.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("version:"):
+                        cur_plugin = line.split(":", 1)[1].strip()
+                        break
+                if cur_plugin != "unknown":
                     break
     except Exception:  # noqa: BLE001
         cur_plugin = "unknown"
@@ -208,21 +230,27 @@ def _check_versions(ctx: Any) -> Dict[str, Any]:
         "recorded": versions,
         "mismatches": mismatches,
         "fix": (
-            "重跑 bash plugins/hermes/install-hermes.sh 让 versions 更新到 state.json；"
-            "如果只 hermes 变了，跑 hermes gateway restart + bash plugins/hermes/scripts/miloco-adapter.sh restart"
+            "在 fork 仓库根目录重跑 bash plugins/hermes/install-hermes.sh 让 versions 更新到 state.json；"
+            "如果只 hermes 变了，跑 hermes gateway restart + "
+            "bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh restart"
         ) if mismatches else None,
     }
 
 
 def _check_trace_hooks() -> Dict[str, Any]:
-    """trace.py 是否被 register 了——通过查 $MILOCO_HOME/trace/agent/ 目录近期活动。"""
+    """trace.py 是否被 register 了——通过查 $MILOCO_HOME/trace/agent/ 目录近期活动。
+
+    注意：trace 是 debug 开关，没开过不代表坏了。所以 trace 目录不存在时
+    返回 ``ok=True, note="trace debug 未启用"``，不进 failed_count。
+    """
     from .paths import miloco_home
     trace_dir = miloco_home() / "trace" / "agent"
     if not trace_dir.is_dir():
         return {
-            "ok": False,
-            "error": "trace 目录不存在 — 还没任何 turn 跑过 trace hooks",
-            "fix": "export MILOCO_TRACE_DEBUG=1 后跑一个 turn（hermes -z '...'）",
+            "ok": True,
+            "note": "trace debug 未启用（没跑过 MILOCO_TRACE_DEBUG=1 的 turn）— 不算异常",
+            "enabled": False,
+            "fix": "需要 debug 时再 export MILOCO_TRACE_DEBUG=1 跑一个 turn",
         }
     # 看今天有没有 meta.json 写过
     from datetime import datetime
