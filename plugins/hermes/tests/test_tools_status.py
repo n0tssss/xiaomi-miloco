@@ -330,3 +330,101 @@ def test_plugin_yaml_lists_all_5_tools():
     text = yaml_path.read_text(encoding="utf-8")
     for tool in ("miloco_im_push", "miloco_habit_suggest", "miloco_status", "miloco_test_push", "miloco_notify_bind"):
         assert f"- {tool}" in text, f"plugin.yaml 没列 {tool}"
+
+
+# ─── Issue 5: adapter_health 用 .status_code 而不是 .status ─────────────
+
+
+def test_adapter_health_source_uses_status_not_status_code():
+    """urllib 返回 http.client.HTTPResponse，状态码字段叫 .status（int），
+    不是 .status_code（requests 库的命名）。Source 必须用 .status。
+    之前写错：resp.status_code → AttributeError → except 兜底 → 自检假阳性 ✗。
+    """
+    from pathlib import Path as P
+    src = (P(__file__).resolve().parents[1] / "miloco-plugin" / "tools_status.py").read_text(encoding="utf-8")
+    # 找 _check_adapter_health 函数体
+    start = src.find("def _check_adapter_health")
+    assert start >= 0
+    # 切到下一个 def / class / 顶层 "def " 前
+    rest = src[start:]
+    body_end = rest.find("\ndef ")
+    body = rest[: body_end if body_end > 0 else len(rest)]
+    # 函数体内不能出现 .status_code（排除 docstring 注释里举例的字面量）
+    lines = [
+        ln for ln in body.splitlines()
+        if ".status_code" in ln and not ln.lstrip().startswith(("#", '"""', "'''"))
+    ]
+    assert not lines, (
+        f"_check_adapter_health 还在用 .status_code（urllib 没这个字段，AttributeError 假阳性挂）: {lines}"
+    )
+    # 必须用 .status（http.client.HTTPResponse 的真实字段名）
+    assert "resp.status" in body or ".status\n" in body, "_check_adapter_health 没读 .status"
+
+
+def test_adapter_health_reads_correct_status_field(monkeypatch):
+    """运行时验证：mock urllib 返回的对象带 .status（不是 .status_code）时，
+    _check_adapter_health 必须正确判 ok=True。"""
+    import http.client
+
+    class _FakeResp:
+        # 只实现 urllib 真实会用到的字段：status（int）
+        def __init__(self, code: int) -> None:
+            self.status = code
+        def read(self) -> bytes:
+            return b'{"status":"ok"}'
+        # 故意不实现 .status_code（模拟 http.client.HTTPResponse 的真实行为）
+        def __getattr__(self, name):
+            if name == "status_code":
+                raise AttributeError(
+                    "http.client.HTTPResponse 没有 .status_code 字段"
+                )
+            raise AttributeError(name)
+
+    class _FakeUrlopen:
+        def __init__(self, code: int) -> None:
+            self._code = code
+        def __enter__(self): return _FakeResp(self._code)
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeUrlopen(200)
+
+    monkeypatch.setattr(ts.urllib.request, "urlopen", fake_urlopen)
+    out = ts._check_adapter_health()
+    assert out["ok"] is True, f"adapter /health 200 应该 ok=True，实际: {out}"
+    assert out["status"] == 200
+
+
+def test_adapter_health_5xx_returns_ok_false(monkeypatch):
+    """/health 返 503 → ok=False（避免假阳性）。"""
+    class _FakeResp:
+        def __init__(self, code: int) -> None:
+            self.status = code
+        def read(self) -> bytes: return b""
+
+    class _FakeUrlopen:
+        def __init__(self, code: int) -> None:
+            self._code = code
+        def __enter__(self): return _FakeResp(self._code)
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(ts.urllib.request, "urlopen", lambda req, timeout=None: _FakeUrlopen(503))
+    out = ts._check_adapter_health()
+    assert out["ok"] is False
+    assert out["status"] == 503
+
+
+def test_adapter_health_connection_refused_returns_clear_error(monkeypatch):
+    """adapter 没启（连接拒绝）→ ok=False + 明确 fix 提示（不要被 AttributeError 吞掉）。"""
+    def fake_urlopen(req, timeout=None):
+        raise ConnectionRefusedError("Connection refused")
+
+    monkeypatch.setattr(ts.urllib.request, "urlopen", fake_urlopen)
+    out = ts._check_adapter_health()
+    assert out["ok"] is False
+    # 不要被 AttributeError 误报（之前的 bug 就是 AttributeError 被兜底成"not ok"，
+    # 用户看不到真实原因）
+    assert "AttributeError" not in out.get("error", ""), (
+        f"adapter /health 失败不应是 AttributeError（之前 .status_code bug 会导致这个）: {out}"
+    )
+    assert "miloco-adapter.sh start" in out.get("fix", "")

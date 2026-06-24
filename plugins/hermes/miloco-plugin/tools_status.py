@@ -86,8 +86,12 @@ def _check_adapter_health() -> Dict[str, Any]:
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=_ADAPTER_HEALTH_TIMEOUT_S) as resp:
-            ok = 200 <= resp.status_code < 300
-            return {"ok": ok, "url": url, "status": resp.status_code}
+            # urllib 返回 http.client.HTTPResponse，状态码字段是 .status（int），
+            # 不是 .status_code（那是 requests 库的命名）。之前写错会 AttributeError
+            # → except 兜底成 "adapter not ok" → 自检假阳性挂。
+            code = resp.status
+            ok = 200 <= code < 300
+            return {"ok": ok, "url": url, "status": code}
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
