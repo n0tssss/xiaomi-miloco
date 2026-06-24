@@ -88,7 +88,10 @@ def test_install_im_detection_checks_auth_json_providers():
 def test_install_im_detection_checks_auth_json_top_level():
     """IM 探测必须读 auth.json 顶层（旧 Hermes 版本可能不用 providers）。"""
     text = INSTALL_SH.read_text(encoding="utf-8")
-    assert "1.5) auth.json 顶层" in text
+    # 重写 IM 探测后编号 1.5 -> 2.5（现在是 hermes send --list + 4 个 fallback 段）
+    assert "auth.json 顶层" in text
+    # 还要保留对顶层（非 providers 段）的实际读取逻辑
+    assert "auth_cfg.get(plat)" in text or "alt_cfg.get(plat)" in text
 
 
 def test_install_im_detection_checks_env_vars():

@@ -27,8 +27,34 @@ class _FakeCtx:
         self.calls: list[Dict[str, Any]] = []
 
     def dispatch_tool(self, name: str, args: Dict[str, Any]) -> str:
+        """保留兼容，但实际 notify_owner 现在走 subprocess.run，不调这个。"""
         self.calls.append({"name": name, "args": args})
         return json.dumps({"success": True, "platform": "feishu", "chat_id": "oc_xxx"})
+
+
+class _FakeCompleted:
+    def __init__(self, *, returncode: int = 0, stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _patch_hermes_send(monkeypatch, *, payload=None, returncode: int = 0):
+    """把 tools_status / tools_notify 用的 subprocess.run 替换成 fake。
+
+    记录最近一次调用的 cmd，给 test_push 三个测试用。
+    """
+    from miloco_plugin_pkg import tools_notify as tn
+    monkeypatch.setattr(tn.shutil, "which", lambda _: "/usr/local/bin/hermes")
+
+    state = {"last_cmd": None}
+
+    def fake_run(cmd, **kwargs):
+        state["last_cmd"] = cmd
+        return _FakeCompleted(returncode=returncode, stdout=json.dumps(payload or {}))
+
+    monkeypatch.setattr(tn.subprocess, "run", fake_run)
+    return state
 
 
 # ─── schema ──────────────────────────────────────────────────────────────
@@ -158,11 +184,12 @@ def test_versions_mismatch_detected(tmp_path: Path):
 
 
 def test_trace_hooks_empty_trace_dir(tmp_path: Path, monkeypatch):
-    """trace 目录不存在 → ok=False（首次跑）。"""
+    """trace 目录不存在 → ok=True + note（debug 没开过 ≠ 坏了，不进 failed）。"""
     monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
     out = ts._check_trace_hooks()
-    assert out["ok"] is False
-    assert "trace 目录不存在" in out["error"]
+    assert out["ok"] is True
+    assert out["enabled"] is False
+    assert "trace debug 未启用" in out["note"]
 
 
 def test_trace_hooks_today_dir_no_files(tmp_path: Path, monkeypatch):
@@ -205,25 +232,37 @@ def test_test_push_no_target_returns_clear_error(tmp_path: Path):
     assert "no deliver target" in result["error"]
 
 
-def test_test_push_success(tmp_path: Path):
+def test_test_push_success(tmp_path: Path, monkeypatch):
     (tmp_path / "state.json").write_text(
         json.dumps({"deliver": {"target": "feishu"}}), encoding="utf-8"
+    )
+    state = _patch_hermes_send(
+        monkeypatch,
+        payload={"success": True, "platform": "feishu", "chat_id": "oc_xxx"},
     )
     ctx = _FakeCtx(tmp_path)
     result = ts.test_push(ctx, "user-supplied message")
     assert result["ok"] is True
     assert result["platform"] == "feishu"
-    assert len(ctx.calls) == 1
-    assert "user-supplied message" in ctx.calls[0]["args"]["message"]
+    # 验证调了 hermes send 且 message 含用户传的内容
+    cmd = state["last_cmd"]
+    assert cmd is not None
+    assert cmd[1:3] == ["send", "--to"]
+    assert cmd[3] == "feishu"
+    assert "user-supplied message" in cmd[6]
 
 
-def test_test_push_default_message_includes_timestamp(tmp_path: Path):
+def test_test_push_default_message_includes_timestamp(tmp_path: Path, monkeypatch):
     (tmp_path / "state.json").write_text(
         json.dumps({"deliver": {"target": "feishu"}}), encoding="utf-8"
     )
+    state = _patch_hermes_send(
+        monkeypatch,
+        payload={"success": True, "platform": "feishu"},
+    )
     ctx = _FakeCtx(tmp_path)
     ts.test_push(ctx)  # 不传 message
-    sent = ctx.calls[0]["args"]["message"]
+    sent = state["last_cmd"][6]
     assert "miloco test push" in sent
 
 
@@ -288,10 +327,11 @@ def test_status_handler_returns_json(tmp_path: Path):
     assert "checks" in out
 
 
-def test_test_push_handler_returns_json(tmp_path: Path):
+def test_test_push_handler_returns_json(tmp_path: Path, monkeypatch):
     (tmp_path / "state.json").write_text(
         json.dumps({"deliver": {"target": "feishu"}}), encoding="utf-8"
     )
+    _patch_hermes_send(monkeypatch, payload={"success": True, "platform": "feishu"})
     ctx = _FakeCtx(tmp_path)
     handler = ts.make_test_push_handler(ctx)
     out = json.loads(handler({"message": "hello"}))
