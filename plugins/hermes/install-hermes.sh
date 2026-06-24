@@ -519,8 +519,8 @@ if hermes_bin:
                     if target:
                         found.append(target)
                         break  # 每平台只取第一个 channel（home channel）
-            if found:
-                source = "hermes send --list --json"
+                if found:
+                    source = "hermes send --list --json"
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         pass
 
