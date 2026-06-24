@@ -593,6 +593,58 @@ else
 fi
 mark_done 4.5
 
+# --- 4.7 同步本地感知 ONNX 模型到 MILOCO_HOME/models/ ---
+# 对齐上游 install.sh --agent-finish 的"下载感知模型"步骤（见
+# upstream install-guide.md 第 131 行"下载感知模型"）。
+#
+# 上游 install.sh 会从自己的 release assets 下模型到 ~/.openclaw/miloco/models/，
+# hermes fork 走的是"plugin in fork 仓库"路线，不能复用 upstream 下载逻辑，
+# 但 fork 仓库的 backend/miloco/src/miloco/perception/models/ 目录里其实打包了
+# 同一份模型 — 直接 cp 即可（避免再下 80MB+）。
+#
+# 跳过条件：MILOCO_HOME/models/det_4C.onnx 已存在（用户已装）。
+step 4.7 "同步本地感知 ONNX 模型 → ${MILOCO_HOME}/models/"
+MODEL_SRC="$HERE/../../backend/miloco/src/miloco/perception/models"
+if [ ! -d "$MODEL_SRC" ]; then
+  warn "fork 仓库里找不到 ONNX 模型源目录：$MODEL_SRC"
+  warn "感知引擎可能跑不起来（perceive query 报 models_missing）"
+  warn "修法：手动 git pull 拉新，或从 upstream release 下载到 $MILOCO_HOME/models/"
+else
+  mkdir -p "$MILOCO_HOME/models"
+  # 同步 .onnx + .json（bge tokenizer）；已存在的不覆盖（保留用户手动调整）
+  synced=0
+  skipped=0
+  for f in "$MODEL_SRC"/*.onnx "$MODEL_SRC"/*.json; do
+    [ -f "$f" ] || continue
+    bn="$(basename "$f")"
+    if [ -f "$MILOCO_HOME/models/$bn" ]; then
+      skipped=$((skipped + 1))
+    else
+      cp "$f" "$MILOCO_HOME/models/$bn"
+      synced=$((synced + 1))
+    fi
+  done
+  info "  同步 ONNX 模型：新增 $synced 个、跳过已存在 $skipped 个"
+  info "  模型目录：$MILOCO_HOME/models/"
+
+  # 在 config.json 写 models 字段（settings.models_dir 默认读这里）
+  if [ -f "$MILOCO_HOME/config.json" ]; then
+    "$PYTHON" - "$MILOCO_HOME" <<'PY' || true
+import json, sys
+home = sys.argv[1]
+p = f"{home}/config.json"
+try:
+    cfg = json.load(open(p, encoding="utf-8"))
+except Exception:
+    cfg = {}
+cfg["models"] = f"{home}/models"
+json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+print(f"  config.json::models = {home}/models")
+PY
+  fi
+fi
+mark_done 4.7
+
 # --- 5. patch ${MILOCO_HOME}/config.json ---
 step 5 "patch ${MILOCO_HOME}/config.json 的 agent 段"
 # backup 文件名加 PID + 纳秒，避免 30s 内 reinstall 撞名
