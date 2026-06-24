@@ -321,7 +321,21 @@ if [ ! -d "$HERMES_HOME" ]; then
   err "找不到 Hermes 目录 ${HERMES_HOME}，请先装 Hermes Agent"; exit 1
 fi
 if [ ! -f "$MILOCO_HOME/config.json" ]; then
-  err "找不到 ${MILOCO_HOME}/config.json，请确认 MILOCO_HOME 正确（或 export MILOCO_HOME=...）"; exit 1
+  # 第一次装：miloco 后端可能没初始化 config.json。两种情况处理：
+  #   1) miloco service start 会自动 init（upstream behavior）
+  #   2) 如果 start 后还是没 config.json，给用户明确指引而不是直接退出
+  info "${MILOCO_HOME}/config.json 不存在，尝试 miloco service start 自动初始化..."
+  if ! miloco-cli service start 2>&1 | tail -3; then
+    err "miloco-cli service start 失败，config.json 还是没生成"
+    err "请手动跑：miloco-cli init 或 export MILOCO_HOME=$HOME/.openclaw/miloco 后重跑 install"
+    exit 1
+  fi
+  if [ ! -f "$MILOCO_HOME/config.json" ]; then
+    err "miloco service start 后 ${MILOCO_HOME}/config.json 还是不存在"
+    err "可能 miloco backend 的 Python venv 缺包。看 $(miloco-cli service logs 2>&1 | tail -5)"
+    exit 1
+  fi
+  info "config.json 自动初始化成功"
 fi
 
 # 1.5 自动拉起 miloco backend（upstream install.py 注册了 atexit._stop_service，
@@ -380,6 +394,95 @@ if [ -d "$MILOCO_HOME" ]; then
     warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
   fi
 fi
+
+# --- 1.7 MILOCO_HOME 持久化（写进 shell rc，下次新 shell 不用再 export） ---
+# 用户的 shell rc 文件（macOS = ~/.zshrc，Linux = ~/.bashrc，WSL Git Bash = ~/.bashrc）
+SHELL_RC=""
+case "${SHELL:-}" in
+  */zsh)  SHELL_RC="$HOME/.zshrc" ;;
+  */bash) SHELL_RC="$HOME/.bashrc" ;;
+  *)      SHELL_RC="$HOME/.bashrc" ;;  # 兜底 bash
+esac
+if [ -n "$MILOCO_HOME" ] && [ "$MILOCO_HOME" != "$HOME/.openclaw/miloco" ]; then
+  # 用户用了非默认路径，持久化
+  if [ -n "$SHELL_RC" ] && [ -f "$SHELL_RC" ] && ! grep -q "export MILOCO_HOME=" "$SHELL_RC" 2>/dev/null; then
+    echo "" >> "$SHELL_RC"
+    echo "# miloco Hermes 兼容层" >> "$SHELL_RC"
+    echo "export MILOCO_HOME=\"$MILOCO_HOME\"" >> "$SHELL_RC"
+    info "MILOCO_HOME 已持久化到 $SHELL_RC"
+  fi
+fi
+
+# --- 1.8 config.json::server.python_bin auto-fix ---
+# 现象：miloco 用 uv 装时 backend 装在 ~/.local/share/uv/tools/miloco/bin/python，
+# 但 miloco service start 用的是 system python3，找不到 miloco 模块 → backend 装包失败。
+# 修法：扫 uv venv + pyenv venv，找到 miloco 包所在 python，patch 进 config.json。
+if [ -f "$MILOCO_HOME/config.json" ]; then
+  CUR_PY_BIN="$("$PYTHON" -c "
+import json
+try:
+    d = json.load(open('$MILOCO_HOME/config.json'))
+    print(d.get('server', {}).get('python_bin', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null || true)"
+
+  # 测试当前配置的 python_bin 能不能 import miloco
+  NEEDS_FIX=0
+  if [ -n "$CUR_PY_BIN" ] && [ -x "$CUR_PY_BIN" ]; then
+    if ! "$CUR_PY_BIN" -c 'import miloco' >/dev/null 2>&1; then
+      NEEDS_FIX=1
+    fi
+  else
+    # 当前没配或配的 python 不存在，扫常见 venv 路径
+    NEEDS_FIX=1
+  fi
+
+  if [ "$NEEDS_FIX" -eq 1 ]; then
+    # 扫 uv 装的 miloco venv
+    FOUND_PY=""
+    for cand in \
+      "$HOME/.local/share/uv/tools/miloco/bin/python" \
+      "$HOME/.local/share/uv/tools/miloco/bin/python3" \
+      "$HOME/.venvs/miloco/bin/python" \
+      "$HOME/.venvs/miloco/bin/python3"
+    do
+      if [ -x "$cand" ] && "$cand" -c 'import miloco' >/dev/null 2>&1; then
+        FOUND_PY="$cand"
+        break
+      fi
+    done
+    if [ -z "$FOUND_PY" ]; then
+      # fallback: 用当前 python 试装 miloco 包（如果 pip 可用）
+      if "$PYTHON" -m pip --version >/dev/null 2>&1; then
+        info "config.json::server.python_bin 找不到能 import miloco 的 python，尝试 pip install miloco..."
+        if "$PYTHON" -m pip install --quiet miloco 2>&1 | tail -3; then
+          FOUND_PY="$PYTHON"
+        fi
+      fi
+    fi
+
+    if [ -n "$FOUND_PY" ]; then
+      info "auto-fix: config.json::server.python_bin = $FOUND_PY"
+      "$PYTHON" - "$MILOCO_HOME" "$FOUND_PY" <<'PY'
+import json, sys
+from pathlib import Path
+home, py_bin = sys.argv[1], sys.argv[2]
+p = Path(home) / "config.json"
+try:
+    cfg = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    cfg = {}
+cfg.setdefault("server", {})["python_bin"] = py_bin
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+PY
+    else
+      warn "config.json::server.python_bin auto-fix 失败：找不到能 import miloco 的 python"
+      warn "手动修：${MILOCO_HOME}/config.json::server.python_bin = <装 miloco 包的 python 路径>"
+    fi
+  fi
+fi
+
 mark_done 1
 
 # --- 2. 拿/复用 Bearer ---
