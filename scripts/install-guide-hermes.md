@@ -10,6 +10,22 @@ metadata:
 
 把 miloco 装到一台**已经装了 Hermes Agent** 的机器上。Hermes 兼容层在社区 fork `n0tssss/xiaomi-miloco` 的 `plugins/hermes/` 下。
 
+## 与上游 OpenClaw 安装的差异
+
+上游 Xiaomi/xiaomi-miloco 的 `scripts/install-guide.md`（3 步：Prepare → Ask → Finish）走的是 OpenClaw 插件 + 单脚本路线。Hermes fork 走的是 **plugin in fork 仓库**路线，最大的差异在模型同步和感知引擎验证：
+
+| 项 | 上游（OpenClaw） | hermes fork | 状态 |
+|---|---|---|---|
+| 单脚本安装 | `install.sh --agent-prepare/finish` 一条龙 | `install-hermes.sh` + 引导式 Step 2 | ✅ 对齐 |
+| 账号 / Omni 模型配置 | `install.sh` 内部 patch | 引导用户用 `miloco-cli account authorize` / `miloco-cli config set` | ✅ 对齐 |
+| **本地感知 ONNX 模型同步** | **`install.sh --agent-finish` 自动从 upstream release 下到 `~/.openclaw/miloco/models/`** | **`install-hermes.sh` Step 4.7 自动从 fork 仓库的 `backend/miloco/src/miloco/perception/models/` cp 到 `~/.openclaw/miloco/models/`，并写 `config.json::models` 字段** | ✅ **本版本补齐** |
+| Step 3 验证 | 上游只验 backend /health | hermes 7 步验证（多 6/6.5/7 三步，专门验感知引擎链路） | ✅ 严格 |
+| 故障排除表 | 6 条（含"模型下载失败"） | 详见下方故障排除 | ✅ 对齐 |
+
+**为什么要补 Step 4.7**：上游 install.sh 跑完 `--agent-finish` 会自动从 Xiaomi 上游 release 下 ~80MB 的 ONNX 模型（det_4C.onnx + human_body_reid_v2.onnx + bge + silero_vad）。Hermes fork 走的是"plugin 在 fork 仓库内"路线，复用不了上游下载逻辑——**但 fork 仓库的 `backend/miloco/src/miloco/perception/models/` 目录里其实打包了同一份模型**，直接 cp 即可。这一步漏掉的话，感知引擎会因为 `models_missing` 起不来，perceive query 永远 1000 报错，**智能触发链路全断但 /health 还显示 ok**，用户毫无感知。
+
+**为什么 Step 3 验证要加 #7（`perceive query` 真调一次）**：上游 install.sh 只验 backend `/health`，**不验感知引擎**。即便 ONNX 模型齐了，如果 Omni 模型不支持 video_url 输入（比如纯文本模型被错填到 omni 位），感知链路还是断的。**7 步验证里的第 7 步直接调一次 perceive query**，能把这类问题暴露出来。
+
 ## 用户的 3 步
 
 ```bash
@@ -272,11 +288,11 @@ lsof -nP -iTCP:8642 -sTCP:LISTEN 2>/dev/null | head -3
 
 `install-hermes.sh` 已经跑过了，gateway 也重启了。**agent 自跑下面 5 步验证**，每步把 PASS/FAIL 打印出来。
 
-### 3.1 5 步验证
+### 3.1 7 步验证
 
 ```bash
 # 1. 插件 enabled？
-hermes plugins list 2>/dev/null | grep -E "miloco.*│ enabled │"
+hermes plugins list --plain --no-bundled 2>/dev/null | grep -E "^enabled.*miloco$"   # 应有 enabled ... miloco 这一行
 
 # 2. 16 skill 装上？
 ls -d ~/.hermes/skills/miloco-* 2>/dev/null | wc -l    # 应 16
@@ -291,6 +307,29 @@ curl -sS -o /dev/null -w "adapter /health: %{http_code}\n" http://127.0.0.1:1878
 
 # 5. backend /health 200？
 curl -sS -o /dev/null -w "backend /health: %{http_code}\n" http://127.0.0.1:1810/health     # 应 200
+
+# 6. 本地感知 ONNX 模型齐？感知引擎启不来就这一项挂
+#    上游 install.sh --agent-finish 会自动下载感知模型，hermes fork
+#    install-hermes.sh Step 4.7 自动同步 fork 仓库里的 ONNX 到
+#    ~/.openclaw/miloco/models/，所以这一步主要验证 Step 4.7 真生效了
+test -d ~/.openclaw/miloco/models && \
+  ls ~/.openclaw/miloco/models/{det_4C,human_body_reid_v2,bge-small-zh-v1.5-int8,silero_vad}.onnx ~/.openclaw/miloco/models/bge-small-zh-v1.5-tokenizer.json 2>/dev/null | wc -l    # 应 5
+# 6.5 config.json::models 字段指向模型目录？
+python3 -c "import json; print('config.json::models =', json.load(open(r'$HOME/.openclaw/miloco/config.json')).get('models','(unset)'))"
+
+# 7. 感知引擎真能调通？用任意一个在线摄像头试一次 perceive query
+#    这一步会真正调 Omni API，能直接验证整条链路通不通。
+#    失败 → 排查 Omni 模型格式 / key 是否对 / 是不是支持 video_url 输入
+miloco-cli perceive devices 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+cams = [c for c in d.get('data', []) if c.get('device_type') == 'camera' and c.get('online')]
+print('first_online_did =', cams[0]['did'] if cams else 'NONE')
+" | tee /tmp/miloco_first_cam.txt
+FIRST_DID="$(grep first_online_did /tmp/miloco_first_cam.txt | awk '{print $3}')"
+if [ -n "$FIRST_DID" ] && [ "$FIRST_DID" != "NONE" ]; then
+  miloco-cli perceive query --source "$FIRST_DID" --query "画面里有什么？"
+fi
 ```
 
 ### 3.2 状态报告（**实际值填进去，不要占位符**）
