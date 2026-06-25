@@ -64,8 +64,26 @@ def allowed_home_ids(kv_repo: KVRepo) -> set[str]:
 
 
 def denied_camera_dids(kv_repo: KVRepo) -> set[str]:
-    """已停用的相机 did 集合；空表示全部启用。"""
-    return set(_load_list(kv_repo, ScopeConfigKeys.CAMERA_BLACK_LIST_KEY))
+    """已停用的相机 did 集合（合并 video / audio 双黑名单 + 旧单 key）。
+
+    用于发现路径（``discover_devices`` cap=True）：任一模态关闭的 did 都不应进
+    连接集 / 投喂上限计数。
+    """
+    return (
+        denied_video_camera_dids(kv_repo)
+        | denied_audio_camera_dids(kv_repo)
+        | set(_load_list(kv_repo, ScopeConfigKeys.CAMERA_BLACK_LIST_KEY))
+    )
+
+
+def denied_video_camera_dids(kv_repo: KVRepo) -> set[str]:
+    """停用视频感知的 did 集；空表示全部启用视频感知。"""
+    return set(_load_list(kv_repo, ScopeConfigKeys.CAMERA_VIDEO_BLACK_LIST_KEY))
+
+
+def denied_audio_camera_dids(kv_repo: KVRepo) -> set[str]:
+    """停用音频感知的 did 集；空表示全部启用音频感知。"""
+    return set(_load_list(kv_repo, ScopeConfigKeys.CAMERA_AUDIO_BLACK_LIST_KEY))
 
 
 def is_home_allowed(kv_repo: KVRepo, home_id: str | None) -> bool:
@@ -112,9 +130,31 @@ def set_homes_in_use(
 def set_cameras_in_use(
     kv_repo: KVRepo, dids: list[str], in_use: bool
 ) -> tuple[list[str], bool]:
-    """批量切换相机启用状态。去重后一次性写入 KV。"""
+    """批量切换相机启用状态（写旧 key，向后兼容）。
+
+    注意：新代码优先用 ``set_cameras_video_in_use`` / ``set_cameras_audio_in_use``
+    双 key 写入。本函数保留仅供旧测试 / 迁移路径使用。
+    """
     return _toggle_members(
         kv_repo, ScopeConfigKeys.CAMERA_BLACK_LIST_KEY, dids, include=not in_use
+    )
+
+
+def set_cameras_video_in_use(
+    kv_repo: KVRepo, dids: list[str], in_use: bool
+) -> tuple[list[str], bool]:
+    """批量切换相机视频感知开关。``in_use=False`` 加入视频黑名单。"""
+    return _toggle_members(
+        kv_repo, ScopeConfigKeys.CAMERA_VIDEO_BLACK_LIST_KEY, dids, include=not in_use
+    )
+
+
+def set_cameras_audio_in_use(
+    kv_repo: KVRepo, dids: list[str], in_use: bool
+) -> tuple[list[str], bool]:
+    """批量切换相机音频感知开关。``in_use=False`` 加入音频黑名单。"""
+    return _toggle_members(
+        kv_repo, ScopeConfigKeys.CAMERA_AUDIO_BLACK_LIST_KEY, dids, include=not in_use
     )
 
 

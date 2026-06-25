@@ -179,16 +179,35 @@ class HomeSwitchRequest(BaseModel):
 
 
 class CameraToggleItem(BaseModel):
-    """单个相机的启用/停用操作。"""
+    """单个相机的感知开关操作（v2：per-camera × per-modality 矩阵）。
+
+    三个开关字段都是可选（omitted = 不改）：
+    - ``in_use``：便捷别名，true=同时启用视频+音频感知；false=同时关闭两路
+    - ``video_enabled``：显式只改视频感知
+    - ``audio_enabled``：显式只改音频感知
+
+    优先级：``video_enabled`` / ``audio_enabled`` 显式给 → 用之；否则用 ``in_use``
+    应用到对应模态。同一请求里 ``in_use`` + ``video_enabled`` 都给时，video 走
+    ``video_enabled``、audio 走 ``in_use``（保持各模态独立语义）。
+    """
 
     did: str = Field(..., min_length=1, description="相机 did")
-    in_use: bool = Field(
-        ..., description="true = 启用（恢复接入）；false = 停用（不接入）"
+    in_use: bool | None = Field(
+        default=None,
+        description="便捷别名：true=同时启用视频+音频感知；false=同时关闭两路。omitted = 不改。",
+    )
+    video_enabled: bool | None = Field(
+        default=None,
+        description="显式改视频感知开关。omitted = 不改。优先级高于 in_use。",
+    )
+    audio_enabled: bool | None = Field(
+        default=None,
+        description="显式改音频感知开关。omitted = 不改。优先级高于 in_use。",
     )
 
 
 class CameraToggleRequest(BaseModel):
-    """批量切换相机启用状态。每项独立指定 did + in_use。"""
+    """批量切换相机感知状态。每项独立指定 did + 模态字段。"""
 
     items: list[CameraToggleItem] = Field(..., min_length=1)
 

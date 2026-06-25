@@ -7,6 +7,9 @@
  */
 
 import * as realImpl from "./real";
+
+// 把 real.ts 的 per-modality toggle 类型重导出,让 App.tsx 等调用方少 import 路径。
+export type CameraToggleItem = realImpl.CameraToggleItem;
 import { apiFetch } from "./client";
 import type {
   ActivityEvent,
@@ -282,10 +285,9 @@ export async function refreshCameraOnline(homeId?: HomeId): Promise<void> {
 }
 
 export async function toggleScopeCamera(
-  dids: string[],
-  inUse: boolean,
+  items: CameraToggleItem[],
 ): Promise<void> {
-  return impl.realToggleScopeCamera(dids, inUse);
+  return impl.realToggleScopeCamera(items);
 }
 
 export async function listCameras(homeId?: HomeId): Promise<PerceptionCamera[]> {

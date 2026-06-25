@@ -217,6 +217,10 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 return
 
         collect_cfg = get_settings().perception.collect
+        # v2：音频感知按 KV 开关订阅。视频感知始终订阅（miloco 的核心模态，
+        # 不支持纯音频摄像头）。用户切换 audio_enabled 后，下次 sync_devices
+        # 触发 disconnect + connect 重订音频流。
+        audio_enabled = self._audio_enabled_for(did)
 
         state = _CameraDeviceState(
             did=did,
@@ -241,18 +245,27 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             logger.error("Failed to subscribe decoded video for %s: %s", did, e)
 
         # Subscribe decoded audio frame stream (multi-reg)
-        try:
-            reg_id = await self._miot_proxy.start_camera_decode_audio_stream(
-                did, DEFAULT_AUDIO_CHANNEL, self._make_decoded_audio_callback(did)
+        # 仅在 audio_enabled=true 时订阅；否则跳过，下次 sync_devices 时若用户
+        # 重新开启再订。
+        if audio_enabled:
+            try:
+                reg_id = await self._miot_proxy.start_camera_decode_audio_stream(
+                    did, DEFAULT_AUDIO_CHANNEL, self._make_decoded_audio_callback(did)
+                )
+                state.decoded_audio_reg_id = reg_id
+            except Exception as e:
+                logger.error("Failed to subscribe decoded audio for %s: %s", did, e)
+        else:
+            logger.info(
+                "Skipping decoded_audio subscribe for %s (audio_enabled=false)", did
             )
-            state.decoded_audio_reg_id = reg_id
-        except Exception as e:
-            logger.error("Failed to subscribe decoded audio for %s: %s", did, e)
 
         # 两路流都没订上 = camera_img_manager 缺失（典型：登录时相机 LAN 未就绪，
         # refresh_cameras 没建成 manager，start_*_stream 返回 -1 静默失败）。保留该
         # device 只会让 active_sources 报「已连」假象，且 did 留在 _devices 使后续
         # sync 早退、永不重试。剔除它，交给 sync_devices 的按需补建在下轮重连。
+        # 注意：纯音频设备（audio_enabled=true 但 video 失败）= 1 路成功，保留；
+        # 纯视频设备（audio_enabled=false 但 video 失败）= 0 路成功，剔除。
         if state.decoded_video_reg_id < 0 and state.decoded_audio_reg_id < 0:
             self._devices.pop(did, None)
             logger.warning(
@@ -261,6 +274,25 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 did,
             )
             return
+
+    def _audio_enabled_for(self, did: str) -> bool:
+        """读 KV 拿这台相机的音频感知开关状态。
+
+        注意：每连一次都查 KV（不是 cache），保证用户切换 audio_enabled 后
+        下次 connect_device 立即生效。KVRepo 内部有内存缓存，频繁读不卡。
+        """
+        try:
+            from miloco.miot.filter import denied_audio_camera_dids
+
+            kv = self._miot_proxy._kv_repo
+            return did not in denied_audio_camera_dids(kv)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Audio-enabled lookup failed for %s (defaulting to enabled): %s",
+                did,
+                e,
+            )
+            return True
 
     async def disconnect_device(self, did: str) -> None:
         state = self._devices.pop(did, None)

@@ -31,10 +31,14 @@ from miloco.miot.client import MiotProxy, build_sub_device_names
 from miloco.miot.filter import (
     MAX_ENABLED_CAMERAS,
     allowed_home_ids,
+    denied_audio_camera_dids,
     denied_camera_dids,
+    denied_video_camera_dids,
     filter_by_home,
     is_home_allowed,
+    set_cameras_audio_in_use,
     set_cameras_in_use,
+    set_cameras_video_in_use,
     set_homes_in_use,
 )
 from miloco.miot.lru import LRUStore
@@ -931,10 +935,21 @@ class MiotService:
             h["in_use"] = h["home_id"] in allow
         return homes
 
-    async def list_cameras_with_state(self) -> list[dict]:
-        """列出当前启用家庭下的相机，每项含 is_online / in_use / connected。"""
-        denied = denied_camera_dids(self._kv_repo)
-        connected = self._connected_camera_dids()
+async def list_cameras_with_state(self) -> list[dict]:
+        """列出当前启用家庭下的相机，每项含完整感知状态。
+
+        返回字段：
+        - did / name / room_name / is_online / connected（与原版一致）
+        - in_use（v1 字段，保留向后兼容） = video_enabled or audio_enabled
+        - video_enabled（v2 新增）：这台是否启用了视频感知
+        - audio_enabled（v2 新增）：这台是否启用了音频感知
+
+        注意：本方法返回**所有米家摄像头**（未应用感知黑名单过滤）——
+        UI 表格始终列出全部设备，离线 / 全关摄像头也展示。感知黑名单只
+        影响 ``discover_devices``（连接路径）与 ``toggle_camera``（上限校验）。
+        """
+        video_denied = denied_video_camera_dids(self._kv_repo)
+        audio_denied = denied_audio_camera_dids(self._kv_repo)
         cameras = filter_by_home(
             self._kv_repo, await self._miot_proxy.get_cameras() or {}
         )
@@ -947,6 +962,8 @@ class MiotService:
             online = bool(getattr(info, "online", False)) and bool(
                 getattr(info, "lan_online", False)
             )
+            video_enabled = did not in video_denied
+            audio_enabled = did not in audio_denied
             out.append(
                 {
                     "did": did,
@@ -955,20 +972,50 @@ class MiotService:
                     # 米家默认相机名常是"小米智能摄像机 2 代"等泛称，光看 name 难辨。
                     "room_name": getattr(info, "room_name", None),
                     "is_online": online,
-                    "in_use": did not in denied,
+                    # in_use = 任一模态开启（向后兼容老前端代码）
+                    "in_use": video_enabled or audio_enabled,
                     "connected": did in connected,
+                    # v2 新增：per-modality 开关状态
+                    "video_enabled": video_enabled,
+                    "audio_enabled": audio_enabled,
                 }
             )
         return out
 
     async def toggle_camera(self, items: list[dict]) -> list[dict]:
-        """批量切换相机启用状态。每项 {"did": str, "in_use": bool}。
+        """批量切换相机感知开关（v2：per-camera × per-modality 矩阵）。
+
+        每项形如 ``{"did": str, "in_use"?: bool, "video_enabled"?: bool, "audio_enabled"?: bool}``。
+        三个开关字段都可选；解析规则：
+        - ``video_enabled`` 给定 → 应用到视频模态；未给 → 沿用 ``in_use``（如给定）
+        - ``audio_enabled`` 给定 → 应用到音频模态；未给 → 沿用 ``in_use``（如给定）
+        - ``in_use`` 也未给 → 该项被忽略（无操作）
+
+        上限校验新口径：``MAX_ENABLED_CAMERAS`` = 4 是「任一模态开启 = 1 名额」
+        （同台开两路不重复计数）。这是从 v1「整台 in_use 上限」调整后的语义。
 
         全部校验通过后才一起写入。双向均校验未知 did 防 typo。
         """
-        enable_dids = [i["did"] for i in items if i["in_use"]]
-        disable_dids = [i["did"] for i in items if not i["in_use"]]
-        all_dids = enable_dids + disable_dids
+        # 1. 解析 items → 拆 4 类操作
+        enable_video_dids: list[str] = []
+        disable_video_dids: list[str] = []
+        enable_audio_dids: list[str] = []
+        disable_audio_dids: list[str] = []
+        all_dids: list[str] = []
+        for i in items:
+            did = i["did"]
+            if did not in all_dids:
+                all_dids.append(did)
+            video = i.get("video_enabled", i.get("in_use"))
+            audio = i.get("audio_enabled", i.get("in_use"))
+            if video is True:
+                enable_video_dids.append(did)
+            elif video is False:
+                disable_video_dids.append(did)
+            if audio is True:
+                enable_audio_dids.append(did)
+            elif audio is False:
+                disable_audio_dids.append(did)
 
         cameras = await self._miot_proxy.get_cameras() or {}
         unknown = [d for d in all_dids if d not in cameras]
@@ -977,27 +1024,25 @@ class MiotService:
                 f"Unknown camera did(s) {unknown}; valid: {sorted(cameras.keys())}"
             )
 
-        if enable_dids:
-            # 离线设备禁止「开启」投喂:它被感知接入层 online_only 过滤、永远连不上,
-            # 开了也不出画面、徒占上限名额。只拦「开启」——已启用的设备掉线后仍保留
-            # inUse=true(允许态不被强制改),且可正常被「关闭」(disable 不走这条校验)。
-            # 在线口径 = online && lan_online,与 list_cameras_with_state 的 is_online 一致。
+        # 2. 在线校验（只拦「开启」——已启用设备掉线仍保留允许态,可正常关闭）
+        enable_any_dids = list(set(enable_video_dids) | set(enable_audio_dids))
+        if enable_any_dids:
             def _online(did: str) -> bool:
                 info = cameras[did]
                 return bool(getattr(info, "online", False)) and bool(
                     getattr(info, "lan_online", False)
                 )
 
-            offline_enable = [d for d in enable_dids if not _online(d)]
+            offline_enable = [d for d in enable_any_dids if not _online(d)]
             if offline_enable:
                 raise ValidationException(
                     f"摄像头当前离线,无法开启投喂（{offline_enable}）;请待其上线后再启用"
                 )
 
-            # 上限检查：用户主动 enable 超限时直接报错，不做自动禁用。计数口径与
-            # list_cameras_with_state / refresh_cameras 一致——只数当前启用家庭内、
-            # 未拉黑的相机（get_cameras 返回全部家庭，须按 home 过滤）。
-            denied = denied_camera_dids(self._kv_repo)
+            # 3. 上限校验新口径：模拟操作后"任一模态开启 = 1 名额"
+            # final_enabled = (in_scope ∩ ¬(video_denied ∪ audio_denied)) 净结果
+            video_denied = denied_video_camera_dids(self._kv_repo)
+            audio_denied = denied_audio_camera_dids(self._kv_repo)
 
             def _in_scope(did: str) -> bool:
                 return is_home_allowed(
@@ -1005,26 +1050,38 @@ class MiotService:
                 )
 
             in_scope = {d for d in cameras if _in_scope(d)}
-            # 模拟本批操作后的启用集：现状未拉黑的，先去掉本批 disable，再并入
-            # 本批 enable。enable 最后并入 → 与写库顺序一致（disable 先写、
-            # enable 后写，矛盾输入 enable 胜出）。单向 enable / 单向 disable /
-            # 混合换机都按净结果校验。
-            final_enabled = (
-                (in_scope - denied) - set(disable_dids)
-            ) | (set(enable_dids) & in_scope)
+            # 模拟 disable 操作：把本批要 disable 的 did 从两路黑名单临时去掉
+            sim_video_denied = video_denied - set(disable_video_dids)
+            sim_audio_denied = audio_denied - set(disable_audio_dids)
+            # 模拟 enable 操作：把本批要 enable 的 did 加进模拟白名单
+            sim_video_enabled = (in_scope - sim_video_denied) | (
+                set(enable_video_dids) & in_scope
+            )
+            sim_audio_enabled = (in_scope - sim_audio_denied) | (
+                set(enable_audio_dids) & in_scope
+            )
+            # 新口径：任一模态开启 = 1 名额
+            final_enabled = sim_video_enabled | sim_audio_enabled
             if len(final_enabled) > MAX_ENABLED_CAMERAS:
                 raise ValidationException(
-                    f"最多同时启用 {MAX_ENABLED_CAMERAS} 台摄像头"
-                    f"（操作后将有 {len(final_enabled)} 台），"
-                    f"请先禁用一台再启用新摄像头"
+                    f"最多同时启用 {MAX_ENABLED_CAMERAS} 路感知"
+                    f"（视频+音频任一路开启即占 1 名额，同台两路不重复计数）"
+                    f"（操作后将有 {len(final_enabled)} 路），"
+                    f"请先关闭一路再启用新模态"
                 )
 
         changed = False
-        if disable_dids:
-            _, c = set_cameras_in_use(self._kv_repo, disable_dids, False)
+        if disable_video_dids:
+            _, c = set_cameras_video_in_use(self._kv_repo, disable_video_dids, False)
             changed = changed or c
-        if enable_dids:
-            _, c = set_cameras_in_use(self._kv_repo, enable_dids, True)
+        if enable_video_dids:
+            _, c = set_cameras_video_in_use(self._kv_repo, enable_video_dids, True)
+            changed = changed or c
+        if disable_audio_dids:
+            _, c = set_cameras_audio_in_use(self._kv_repo, disable_audio_dids, False)
+            changed = changed or c
+        if enable_audio_dids:
+            _, c = set_cameras_audio_in_use(self._kv_repo, enable_audio_dids, True)
             changed = changed or c
         if changed:
             # KV 写入后热同步感知订阅(不触发 refresh_cameras,不重建 camera manager,

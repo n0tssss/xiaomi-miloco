@@ -1079,3 +1079,243 @@ async def test_toggle_camera_swap_still_rejects_net_over_limit():
             {"did": b1, "in_use": True},
             {"did": b2, "in_use": True},
         ])
+
+
+# ─── v2: per-camera × per-modality 双黑名单 + 兼容层 ────────────────────────
+
+
+class TestPerModalityBlackList:
+    """视频/音频双 KV 黑名单 + 旧 CAMERA_BLACK_LIST_KEY 兼容层。"""
+
+    def test_video_black_list_round_trip(self):
+        kv = _FakeKV()
+        miot_filter.set_cameras_video_in_use(kv, ["c1", "c2"], False)
+        assert miot_filter.denied_video_camera_dids(kv) == {"c1", "c2"}
+        miot_filter.set_cameras_video_in_use(kv, ["c1"], True)
+        assert miot_filter.denied_video_camera_dids(kv) == {"c2"}
+
+    def test_audio_black_list_round_trip(self):
+        kv = _FakeKV()
+        miot_filter.set_cameras_audio_in_use(kv, ["c1"], False)
+        assert miot_filter.denied_audio_camera_dids(kv) == {"c1"}
+
+    def test_video_and_audio_independent(self):
+        """同一 did 进 video 黑名单,不应影响 audio 黑名单（独立 KV）。"""
+        kv = _FakeKV()
+        miot_filter.set_cameras_video_in_use(kv, ["c1"], False)
+        miot_filter.set_cameras_audio_in_use(kv, ["c1"], False)
+        # 都关 → denied_camera_dids 应包含 c1（union 语义）
+        assert miot_filter.denied_camera_dids(kv) == {"c1"}
+        # 重新开 audio,c1 仍只在 video 黑名单
+        miot_filter.set_cameras_audio_in_use(kv, ["c1"], True)
+        assert miot_filter.denied_video_camera_dids(kv) == {"c1"}
+        assert miot_filter.denied_audio_camera_dids(kv) == set()
+        assert miot_filter.denied_camera_dids(kv) == {"c1"}
+
+    def test_legacy_key_still_denied(self):
+        """兼容层：旧 CAMERA_BLACK_LIST_KEY 的 did 仍被 denied。"""
+        kv = _FakeKV({
+            ScopeConfigKeys.CAMERA_BLACK_LIST_KEY: json.dumps(["legacy_did"]),
+        })
+        assert "legacy_did" in miot_filter.denied_camera_dids(kv)
+
+
+class TestListCamerasWithStateV2:
+    """list_cameras_with_state 返回 video_enabled / audio_enabled 字段。"""
+
+    @staticmethod
+    def _service(kv: _FakeKV, cameras: dict):
+        return _make_service(devices=dict(cameras), cameras=cameras, kv=kv)
+
+    @staticmethod
+    def _setup_kv_home(kv: _FakeKV):
+        kv.set(ScopeConfigKeys.HOME_WHITE_LIST_KEY, json.dumps(["H1"]))
+
+    @staticmethod
+    def _index_by_did(rows):
+        return {r["did"]: r for r in rows}
+
+    async def test_both_modalities_enabled_by_default(self):
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        rows = await svc.list_cameras_with_state()
+        assert rows[0]["video_enabled"] is True
+        assert rows[0]["audio_enabled"] is True
+        assert rows[0]["in_use"] is True
+
+    async def test_audio_only_after_audio_black_list(self):
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        miot_filter.set_cameras_audio_in_use(kv, ["c1"], False)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        rows = await svc.list_cameras_with_state()
+        r = self._index_by_did(rows)["c1"]
+        assert r["video_enabled"] is True
+        assert r["audio_enabled"] is False
+        assert r["in_use"] is True  # 任一模态开启 = in_use
+
+    async def test_all_offline_camera_still_listed(self):
+        """API 始终返回所有米家摄像头,不全关过滤。"""
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        miot_filter.set_cameras_video_in_use(kv, ["c1"], False)
+        miot_filter.set_cameras_audio_in_use(kv, ["c1"], False)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        rows = await svc.list_cameras_with_state()
+        assert self._index_by_did(rows)["c1"]["in_use"] is False
+        # 但设备仍出现在列表里
+        assert [r["did"] for r in rows] == ["c1"]
+
+
+class TestToggleCameraV2:
+    """toggle_camera v2：per-modality 解析 + 上限新口径。"""
+
+    @staticmethod
+    def _service(kv: _FakeKV, cameras: dict):
+        return _make_service(devices=dict(cameras), cameras=cameras, kv=kv)
+
+    @staticmethod
+    def _setup_kv_home(kv: _FakeKV):
+        kv.set(ScopeConfigKeys.HOME_WHITE_LIST_KEY, json.dumps(["H1"]))
+
+    async def test_video_only_modality(self):
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        await svc.toggle_camera([{"did": "c1", "video_enabled": False}])
+        assert miot_filter.denied_video_camera_dids(kv) == {"c1"}
+        assert miot_filter.denied_audio_camera_dids(kv) == set()
+
+    async def test_audio_only_modality(self):
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        await svc.toggle_camera([{"did": "c1", "audio_enabled": False}])
+        assert miot_filter.denied_audio_camera_dids(kv) == {"c1"}
+        assert miot_filter.denied_video_camera_dids(kv) == set()
+
+    async def test_in_use_alias_applies_to_both(self):
+        """只给 in_use=true → 双路都开。"""
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        await svc.toggle_camera([{"did": "c1", "in_use": True}])
+        assert miot_filter.denied_video_camera_dids(kv) == set()
+        assert miot_filter.denied_audio_camera_dids(kv) == set()
+
+    async def test_modality_field_overrides_in_use(self):
+        """显式 video_enabled=false + in_use=true → video 关,audio 开。"""
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        await svc.toggle_camera([
+            {"did": "c1", "in_use": True, "video_enabled": False},
+        ])
+        assert miot_filter.denied_video_camera_dids(kv) == {"c1"}
+        assert miot_filter.denied_audio_camera_dids(kv) == set()
+
+    async def test_unknown_did_rejected(self):
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        with pytest.raises(ValidationException, match="Unknown camera did"):
+            await svc.toggle_camera([{"did": "ghost", "video_enabled": True}])
+
+    async def test_offline_enable_rejected(self):
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        svc = self._service(kv, {
+            "c1": _camera("c1", online=False, lan_online=False),
+        })
+
+        with pytest.raises(ValidationException, match="离线"):
+            await svc.toggle_camera([{"did": "c1", "video_enabled": True}])
+
+    async def test_capacity_uses_union_of_modalities(self):
+        """新口径:任一模态开启=1 名额,同台两路不重复计数。"""
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        # 4 台已全部启用 video
+        for did in ["a", "b", "c", "d"]:
+            miot_filter.set_cameras_video_in_use(kv, [did], True)
+        cams = {d: _camera(d) for d in ["a", "b", "c", "d", "e"]}
+        svc = self._service(kv, cams)
+
+        # 关 a 的 video(腾出 1 名额),开 e 的 audio(占 1 名额) → 不超
+        await svc.toggle_camera([
+            {"did": "a", "video_enabled": False},
+            {"did": "e", "audio_enabled": True},
+        ])
+        # 验证 e 进 audio 黑名单（被 enable 后移除）
+        assert "e" not in miot_filter.denied_audio_camera_dids(kv)
+
+        # 超出上限:开 e 的 video,达到 5 台启用任一模态
+        with pytest.raises(ValidationException, match="最多同时启用"):
+            await svc.toggle_camera([{"did": "e", "video_enabled": True}])
+
+    async def test_no_op_when_no_field_given(self):
+        """三个字段都给 None → 不动 KV,不报错。"""
+        kv = _FakeKV()
+        self._setup_kv_home(kv)
+        miot_filter.set_cameras_video_in_use(kv, ["c1"], False)
+        svc = self._service(kv, {"c1": _camera("c1")})
+
+        await svc.toggle_camera([{"did": "c1"}])
+        # c1 仍在 video 黑名单
+        assert miot_filter.denied_video_camera_dids(kv) == {"c1"}
+
+
+class TestCameraAdapterAudioToggle:
+    """CameraDeviceAdapter 按 audio_enabled KV 订阅音频流。"""
+
+    def test_audio_disabled_skips_audio_subscribe(self, monkeypatch):
+        from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
+
+        kv = _FakeKV()
+        miot_filter.set_cameras_audio_in_use(kv, ["c1"], False)
+
+        proxy = MagicMock()
+        proxy._kv_repo = kv
+        proxy.is_authenticated = True
+        proxy.start_camera_decode_video_stream = AsyncMock(return_value=10)
+        proxy.start_camera_decode_audio_stream = AsyncMock(return_value=11)
+        adapter = CameraDeviceAdapter(miot_proxy=proxy)
+        # 不走 discover
+        monkeypatch.setattr(
+            adapter, "discover_devices", AsyncMock(return_value={"c1": _camera("c1")})
+        )
+
+        asyncio.run(adapter.connect_device("c1"))
+
+        # video 订了,audio 没订
+        proxy.start_camera_decode_video_stream.assert_awaited_once()
+        proxy.start_camera_decode_audio_stream.assert_not_awaited()
+
+    def test_audio_enabled_subscribes_both(self, monkeypatch):
+        from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
+
+        kv = _FakeKV()
+        # 不写 audio 黑名单 → 默认 enabled
+        proxy = MagicMock()
+        proxy._kv_repo = kv
+        proxy.is_authenticated = True
+        proxy.start_camera_decode_video_stream = AsyncMock(return_value=10)
+        proxy.start_camera_decode_audio_stream = AsyncMock(return_value=11)
+        adapter = CameraDeviceAdapter(miot_proxy=proxy)
+        monkeypatch.setattr(
+            adapter, "discover_devices", AsyncMock(return_value={"c1": _camera("c1")})
+        )
+
+        asyncio.run(adapter.connect_device("c1"))
+
+        proxy.start_camera_decode_video_stream.assert_awaited_once()
+        proxy.start_camera_decode_audio_stream.assert_awaited_once()
