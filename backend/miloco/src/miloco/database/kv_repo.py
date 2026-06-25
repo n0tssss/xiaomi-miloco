@@ -212,10 +212,20 @@ class DeviceInfoKeys:
 
 
 class ScopeConfigKeys:
-    """miloco 接入范围限定（家庭启用集 / 摄像头停用集）。
+    """miloco 接入范围限定（家庭启用集 / 摄像头感知模态黑名单）。
 
     值统一为 JSON array 字符串，``"[]"`` / ``NULL`` 都表示空集。
+
+    摄像头黑名单按模态拆分（v2 引入）—— 单台摄像头可独立关闭视频感知或音频感知：
+    - ``CAMERA_VIDEO_BLACK_LIST_KEY``：停用视频感知的 did 集
+    - ``CAMERA_AUDIO_BLACK_LIST_KEY``：停用音频感知的 did 集
+
+    旧的 ``CAMERA_BLACK_LIST_KEY``（停用整台感知）保留只读，向后兼容：
+    旧版本写入的数据迁移期仍被读出，由 :func:`miloco.miot.filter.denied_camera_dids`
+    把 video/audio 双黑名单与旧单 key 合并返出去。
     """
 
     HOME_WHITE_LIST_KEY = "HOME_WHITE_LIST_KEY"       # 已启用的家庭 home_id 列表
-    CAMERA_BLACK_LIST_KEY = "CAMERA_BLACK_LIST_KEY" # 已停用的摄像头 did 列表
+    CAMERA_BLACK_LIST_KEY = "CAMERA_BLACK_LIST_KEY" # 旧：已停用的摄像头 did 列表（保留只读）
+    CAMERA_VIDEO_BLACK_LIST_KEY = "CAMERA_VIDEO_BLACK_LIST_KEY"  # 新：停用视频感知的 did 列表
+    CAMERA_AUDIO_BLACK_LIST_KEY = "CAMERA_AUDIO_BLACK_LIST_KEY"  # 新：停用音频感知的 did 列表
