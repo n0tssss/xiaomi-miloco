@@ -31,6 +31,22 @@
     "miotConnected": "Xiaomi Home connected",
     "miotDevicesCount": "{{n}} devices",
     "miotNotConnected": "Xiaomi Home not connected",
-    "miotCtaConnect": "Connect now"
+    "miotCtaConnect": "Connect now",
+    "table": {
+      "title": "Perception devices",
+      "headerDevice": "Device",
+      "headerRoom": "Room",
+      "headerVideo": "Video perception",
+      "headerAudio": "Audio perception",
+      "headerActions": "Actions",
+      "on": "On",
+      "off": "Off",
+      "bulkVideoAllOn": "Enable all video",
+      "bulkVideoAllOff": "Disable all video",
+      "bulkAudioAllOn": "Enable all audio",
+      "bulkAudioAllOff": "Disable all audio",
+      "offlineHint": "Offline",
+      "empty": "No cameras on this Xiaomi Home account yet"
+    }
   }
 }

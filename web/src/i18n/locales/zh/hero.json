@@ -31,6 +31,22 @@
     "miotConnected": "米家已连",
     "miotDevicesCount": "{{n}} 件设备",
     "miotNotConnected": "米家未连",
-    "miotCtaConnect": "去连一下"
+    "miotCtaConnect": "去连一下",
+    "table": {
+      "title": "感知设备列表",
+      "headerDevice": "设备",
+      "headerRoom": "房间",
+      "headerVideo": "摄像头感知",
+      "headerAudio": "音频感知",
+      "headerActions": "操作",
+      "on": "已开启",
+      "off": "已关闭",
+      "bulkVideoAllOn": "全部开启视频",
+      "bulkVideoAllOff": "全部关闭视频",
+      "bulkAudioAllOn": "全部开启音频",
+      "bulkAudioAllOff": "全部关闭音频",
+      "offlineHint": "已离线",
+      "empty": "米家账号下还没有摄像头"
+    }
   }
 }
