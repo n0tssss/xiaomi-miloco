@@ -210,9 +210,6 @@ function MainApp() {
               miotHasCamera={devices.data.some(
                 (d) => d.category === "camera",
               )}
-              /* 投喂上限唯一来源:后端 MAX_ENABLED_CAMERAS，经 /api/miot/status 下发。
-                 status 未到/出错时兜底 4，与后端默认一致。 */
-              maxStreamCams={status.data?.maxEnabledCameras ?? 4}
               /* 概览页家人 chip 不跳转 —— family tab 才走 PersonDrawer 流。
                  不传 onPersonClick → PersonChip 降级成 div（无 hover/点击反馈）,
                  防住户看到可点 button 形态点了无反馈以为系统坏。 */
