@@ -178,6 +178,7 @@ export interface PerceptionCamera {
 // PerceptionCamera 是「当前 perception 在订阅」的子集（含 channel 用于播放），
 // ScopeCamera 是「米家账号下全集」（含已禁用 / 离线，用于显示开关）。
 // 渲染卡片时 ScopeCamera 是主列表，channel 通过 did 从 PerceptionCamera 字典查。
+// v2：每台相机可独立开关 video / audio 感知，inUse = videoEnabled || audioEnabled。
 export interface ScopeCamera {
   did: string;
   name: string;
@@ -187,6 +188,9 @@ export interface ScopeCamera {
   isOnline: boolean;
   inUse: boolean;
   connected: boolean;
+  // v2 新增:per-modality 感知开关
+  videoEnabled: boolean;
+  audioEnabled: boolean;
 }
 
 // ── 米家家庭接入范围(scope.homes)─────────────────────────────────

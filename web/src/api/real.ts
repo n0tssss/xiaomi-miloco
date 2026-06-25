@@ -913,9 +913,8 @@ export async function realSwitchScopeHome(homeId: string): Promise<void> {
 }
 
 // ── 米家 scope 摄像头（启用 / 禁用全集）────────────────────────
-// 飞书 docx WImSdXQHEobWMaxFWoxcUsBpnjz 设计规范：
-//   - GET 返全部相机 + 状态（含已禁用）
-//   - PUT in_use=false 时 backend 校验 did 必须存在；in_use=true 任意（清理脏数据）
+// v2：per-camera × per-modality 矩阵——每台相机可独立开关 video / audio 感知。
+// in_use 字段保留（向后兼容） = video_enabled || audio_enabled。
 interface BackendScopeCamera {
   did: string;
   name: string | null;
@@ -923,6 +922,9 @@ interface BackendScopeCamera {
   is_online: boolean;
   in_use: boolean;
   connected: boolean;
+  // v2 新增
+  video_enabled: boolean;
+  audio_enabled: boolean;
 }
 
 export async function realListScopeCameras(): Promise<ScopeCamera[]> {
@@ -936,6 +938,9 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     isOnline: c.is_online,
     inUse: c.in_use,
     connected: c.connected,
+    // v2 新增
+    videoEnabled: c.video_enabled,
+    audioEnabled: c.audio_enabled,
   }));
 }
 
@@ -955,13 +960,28 @@ export async function realRefreshCameraOnline(): Promise<void> {
   await apiFetch<Normal<unknown>>("/api/miot/refresh_camera_online");
 }
 
+// v2：CameraToggleItem 三个字段都可选（in_use?/video_enabled?/audio_enabled?）。
+// 调用方按需填；undefined 字段 backend 视为"不改"。
+export interface CameraToggleItem {
+  did: string;
+  inUse?: boolean;
+  videoEnabled?: boolean;
+  audioEnabled?: boolean;
+}
+
 export async function realToggleScopeCamera(
-  dids: string[],
-  inUse: boolean,
+  items: CameraToggleItem[],
 ): Promise<void> {
   await apiFetch<Normal<unknown>>("/api/miot/scope/cameras", {
     method: "PUT",
-    body: JSON.stringify({ items: dids.map((did) => ({ did, in_use: inUse })) }),
+    body: JSON.stringify({
+      items: items.map((i) => ({
+        did: i.did,
+        in_use: i.inUse,
+        video_enabled: i.videoEnabled,
+        audio_enabled: i.audioEnabled,
+      })),
+    }),
   });
   // 写后立即 invalidate + 主动 prefetch homeCache(同 switchScopeHome 同款消 race)。
   invalidateMiotHomeCache();
