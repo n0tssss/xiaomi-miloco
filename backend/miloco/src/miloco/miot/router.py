@@ -518,8 +518,18 @@ async def list_scope_cameras(current_user: str = Depends(verify_token)):
 async def toggle_scope_camera(
     request: CameraToggleRequest, current_user: str = Depends(verify_token)
 ):
+    # v2：透传 video_enabled / audio_enabled / in_use 三字段到 service，
+    # 任何为 None 的字段 service 端按"不改"处理。
     data = await manager.miot_service.toggle_camera(
-        [{"did": i.did, "in_use": i.in_use} for i in request.items]
+        [
+            {
+                "did": i.did,
+                "in_use": i.in_use,
+                "video_enabled": i.video_enabled,
+                "audio_enabled": i.audio_enabled,
+            }
+            for i in request.items
+        ]
     )
     return NormalResponse(code=0, message="ok", data=data)
 
