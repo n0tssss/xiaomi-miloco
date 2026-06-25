@@ -272,6 +272,8 @@ async def test_list_cameras_with_state_flags():
         "c2": _camera("c2", home_id="H1"),
         "c3": _camera("c3", home_id="H2"),
     }
+    # v2:旧 CAMERA_BLACK_LIST_KEY 仍被读取(兼容层),但 list_cameras_with_state
+    # 永远返回所有米家摄像头(不应用感知黑名单)—— UI 表格始终列出全部设备。
     kv = _FakeKV({
         ScopeConfigKeys.HOME_WHITE_LIST_KEY: json.dumps(["H1"]),
         ScopeConfigKeys.CAMERA_BLACK_LIST_KEY: json.dumps(["c1"]),
@@ -284,10 +286,15 @@ async def test_list_cameras_with_state_flags():
 
     # 按家庭过滤：只返回 H1 的相机（c3 属于 H2，被过滤掉）
     assert set(by_did.keys()) == {"c1", "c2"}
-    assert by_did["c1"]["in_use"] is False  # in deny list
+    # v2 永远列出全部设备(不应用黑名单),c1 双新 key 都空 → 默认全开
+    assert by_did["c1"]["in_use"] is True
+    assert by_did["c1"]["video_enabled"] is True
+    assert by_did["c1"]["audio_enabled"] is True
     assert by_did["c1"]["is_online"] is True
     assert by_did["c1"]["connected"] is False
     assert by_did["c2"]["in_use"] is True
+    assert by_did["c2"]["video_enabled"] is True
+    assert by_did["c2"]["audio_enabled"] is True
     assert by_did["c2"]["is_online"] is False  # lan_online=False
     assert by_did["c2"]["connected"] is True
 
@@ -299,14 +306,18 @@ async def test_toggle_camera_writes_disabled():
         devices={"c1": _camera("c1")}, cameras={"c1": _camera("c1")}, kv=kv
     )
 
+    # v2: in_use=False → 同时停 video + audio（双黑名单）
     res = await svc.toggle_camera([{"did": "c1", "in_use": False}])
     assert isinstance(res, list)
     assert any(c["did"] == "c1" and c["in_use"] is False for c in res)
-    assert json.loads(kv.get(ScopeConfigKeys.CAMERA_BLACK_LIST_KEY)) == ["c1"]
+    assert miot_filter.denied_video_camera_dids(kv) == {"c1"}
+    assert miot_filter.denied_audio_camera_dids(kv) == {"c1"}
 
     res = await svc.toggle_camera([{"did": "c1", "in_use": True}])
     assert isinstance(res, list)
     assert any(c["did"] == "c1" and c["in_use"] is True for c in res)
+    assert miot_filter.denied_video_camera_dids(kv) == set()
+    assert miot_filter.denied_audio_camera_dids(kv) == set()
 
 
 @pytest.mark.asyncio
@@ -318,19 +329,19 @@ async def test_toggle_camera_batch_atomic():
         cameras={"c1": _camera("c1"), "c2": _camera("c2")},
         kv=kv
     )
-    # 两个都合法 → 都写入停用集
+    # 两个都合法 → 都写入双黑名单
     res = await svc.toggle_camera([{"did": "c1", "in_use": False}, {"did": "c2", "in_use": False}])
     assert isinstance(res, list)
     dids = {c["did"] for c in res}
     assert dids == {"c1", "c2"}
     assert all(c["in_use"] is False for c in res)
+    assert miot_filter.denied_video_camera_dids(kv) == {"c1", "c2"}
+    assert miot_filter.denied_audio_camera_dids(kv) == {"c1", "c2"}
 
-    # c1 合法 + ghost 未知 → 整批拒绝，c1 不写入
+    # c1 合法 + ghost 未知 → 整批拒绝，c1 不写入(KV 状态不变)
     with pytest.raises(ValidationException):
         await svc.toggle_camera([{"did": "c1", "in_use": False}, {"did": "ghost", "in_use": False}])
-    assert json.loads(kv.get(ScopeConfigKeys.CAMERA_BLACK_LIST_KEY)) == [
-        "c1", "c2"
-    ]  # 不变
+    assert miot_filter.denied_video_camera_dids(kv) == {"c1", "c2"}
 
 
 @pytest.mark.asyncio
@@ -1241,26 +1252,34 @@ class TestToggleCameraV2:
             await svc.toggle_camera([{"did": "c1", "video_enabled": True}])
 
     async def test_capacity_uses_union_of_modalities(self):
-        """新口径:任一模态开启=1 名额,同台两路不重复计数。"""
+        """新口径:任一模态开启=1 名额,同台两路不重复计数。
+
+        设 4 台已全开双模态 → 4 台占满上限。关 a 双模态(腾 1 名额) + 开 e audio
+        (占 1 名额) → 净额 4,应通过。再开第 5 台 video → 净额 5 → 拒。
+        """
         kv = _FakeKV()
         self._setup_kv_home(kv)
-        # 4 台已全部启用 video
+        # 4 台已全部启用 video + audio（双模态都开 = 4 台占 4 名额）
         for did in ["a", "b", "c", "d"]:
             miot_filter.set_cameras_video_in_use(kv, [did], True)
+            miot_filter.set_cameras_audio_in_use(kv, [did], True)
         cams = {d: _camera(d) for d in ["a", "b", "c", "d", "e"]}
         svc = self._service(kv, cams)
 
-        # 关 a 的 video(腾出 1 名额),开 e 的 audio(占 1 名额) → 不超
+        # 关 a 双模态(腾 1 名额) + 开 e audio(占 1 名额) → 净额 4,通过
         await svc.toggle_camera([
-            {"did": "a", "video_enabled": False},
+            {"did": "a", "video_enabled": False, "audio_enabled": False},
             {"did": "e", "audio_enabled": True},
         ])
-        # 验证 e 进 audio 黑名单（被 enable 后移除）
         assert "e" not in miot_filter.denied_audio_camera_dids(kv)
+        assert "a" in miot_filter.denied_video_camera_dids(kv)
+        assert "a" in miot_filter.denied_audio_camera_dids(kv)
 
-        # 超出上限:开 e 的 video,达到 5 台启用任一模态
+        # 超出上限:开第 5 台 f 的 video(占 1 新名额) → 净额 5 → 拒
+        cams_f = {**cams, "f": _camera("f")}
+        svc2 = self._service(kv, cams_f)
         with pytest.raises(ValidationException, match="最多同时启用"):
-            await svc.toggle_camera([{"did": "e", "video_enabled": True}])
+            await svc2.toggle_camera([{"did": "f", "video_enabled": True}])
 
     async def test_no_op_when_no_field_given(self):
         """三个字段都给 None → 不动 KV,不报错。"""

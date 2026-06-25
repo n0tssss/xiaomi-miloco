@@ -935,12 +935,12 @@ class MiotService:
             h["in_use"] = h["home_id"] in allow
         return homes
 
-async def list_cameras_with_state(self) -> list[dict]:
+    async def list_cameras_with_state(self) -> list[dict]:
         """列出当前启用家庭下的相机，每项含完整感知状态。
 
         返回字段：
         - did / name / room_name / is_online / connected（与原版一致）
-        - in_use（v1 字段，保留向后兼容） = video_enabled or audio_enabled
+        - in_use（v1 字段,保留向后兼容） = video_enabled or audio_enabled
         - video_enabled（v2 新增）：这台是否启用了视频感知
         - audio_enabled（v2 新增）：这台是否启用了音频感知
 
@@ -950,6 +950,7 @@ async def list_cameras_with_state(self) -> list[dict]:
         """
         video_denied = denied_video_camera_dids(self._kv_repo)
         audio_denied = denied_audio_camera_dids(self._kv_repo)
+        connected = self._connected_camera_dids()
         cameras = filter_by_home(
             self._kv_repo, await self._miot_proxy.get_cameras() or {}
         )
@@ -981,7 +982,6 @@ async def list_cameras_with_state(self) -> list[dict]:
                 }
             )
         return out
-
     async def toggle_camera(self, items: list[dict]) -> list[dict]:
         """批量切换相机感知开关（v2：per-camera × per-modality 矩阵）。
 
@@ -1040,7 +1040,6 @@ async def list_cameras_with_state(self) -> list[dict]:
                 )
 
             # 3. 上限校验新口径：模拟操作后"任一模态开启 = 1 名额"
-            # final_enabled = (in_scope ∩ ¬(video_denied ∪ audio_denied)) 净结果
             video_denied = denied_video_camera_dids(self._kv_repo)
             audio_denied = denied_audio_camera_dids(self._kv_repo)
 
@@ -1053,13 +1052,14 @@ async def list_cameras_with_state(self) -> list[dict]:
             # 模拟 disable 操作：把本批要 disable 的 did 从两路黑名单临时去掉
             sim_video_denied = video_denied - set(disable_video_dids)
             sim_audio_denied = audio_denied - set(disable_audio_dids)
-            # 模拟 enable 操作：把本批要 enable 的 did 加进模拟白名单
-            sim_video_enabled = (in_scope - sim_video_denied) | (
-                set(enable_video_dids) & in_scope
-            )
-            sim_audio_enabled = (in_scope - sim_audio_denied) | (
-                set(enable_audio_dids) & in_scope
-            )
+            # 模拟 enable 操作：把本批要 enable 的 did 加进模拟白名单,
+            # 同时把本批要 disable 的 did 从启用集移除(即使它原本不在黑名单里)。
+            sim_video_enabled = (
+                (in_scope - sim_video_denied) - set(disable_video_dids)
+            ) | (set(enable_video_dids) & in_scope)
+            sim_audio_enabled = (
+                (in_scope - sim_audio_denied) - set(disable_audio_dids)
+            ) | (set(enable_audio_dids) & in_scope)
             # 新口径：任一模态开启 = 1 名额
             final_enabled = sim_video_enabled | sim_audio_enabled
             if len(final_enabled) > MAX_ENABLED_CAMERAS:
@@ -1092,7 +1092,6 @@ async def list_cameras_with_state(self) -> list[dict]:
         all_cameras = await self.list_cameras_with_state()
         affected = [cam for cam in all_cameras if cam["did"] in set(all_dids)]
         return affected
-
     def _camera_adapter(self):
         """Lazily fetch the perception camera adapter; returns None if unavailable."""
         try:
