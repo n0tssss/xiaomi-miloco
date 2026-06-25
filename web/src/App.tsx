@@ -17,7 +17,6 @@ import {
   refreshCameraOnline,
   pausePerception,
   resumePerception,
-  toggleScopeCamera,
   switchScopeHome,
 } from "./api";
 import { useAsync } from "./hooks/useAsync";
@@ -218,16 +217,10 @@ function MainApp() {
                  不传 onPersonClick → PersonChip 降级成 div（无 hover/点击反馈）,
                  防住户看到可点 button 形态点了无反馈以为系统坏。 */
               onJumpUsage={() => setActiveTab("usage")}
-              onToggleCameras={async (dids, inUse) => {
-                try {
-                  await toggleScopeCamera(dids, inUse);
-                } catch (e) {
-                  toast(
-                    e instanceof Error ? e.message : t("common.switchFailed"),
-                    "warn",
-                  );
-                }
-                // 三个 reload —— LivePlayer iframe src 用 useRef 按 cameraDid 锁住,
+              // v2：PerceptionDeviceTable 内部自己调 toggleScopeCamera,
+              // 这里只挂一个 reload trigger 给"用户改了感知状态后同步刷新"。
+              onToggleCameras={() => {
+                // LivePlayer iframe src 用 useRef 按 cameraDid 锁住,
                 // channelByDid useMemo + iframe React diff 双层防 src 变化触发
                 // iframe 重 mount,reload cameras 安全。新接入 cam 时 cameras.reload
                 // 才能拿到 channel,不 reload 会让多通道 cam 永远兜底 channel=0。
