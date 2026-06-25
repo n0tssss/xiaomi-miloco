@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "build:watch": "vite build --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && node --test tests/helpers_standalone_test.cjs",
+    "test:vitest": "vitest run",
+    "test:node": "node --test tests/helpers_standalone_test.cjs",
     "test:watch": "vitest"
   },
   "dependencies": {
