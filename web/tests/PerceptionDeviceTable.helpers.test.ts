@@ -9,6 +9,9 @@ import type { ScopeCamera } from "@/lib/types";
 import {
   bulkDisableDisabled,
   bulkEnableDisabled,
+  bulkMasterDisableDisabled,
+  bulkMasterEnableDisabled,
+  masterSwitchState,
   rowToggleDisabled,
   sortCamerasByDid,
 } from "@/components/PerceptionDeviceTable.helpers";
@@ -127,5 +130,128 @@ describe("rowToggleDisabled", () => {
 
   it("在线相机 → 不禁 toggle", () => {
     expect(rowToggleDisabled(cam("c1", { isOnline: true }))).toBe(false);
+  });
+});
+
+/* ── master switch helpers (v3 加的) ──────────────────────────── */
+
+describe("masterSwitchState", () => {
+  it("视频 + 音频 都开 → on", () => {
+    expect(
+      masterSwitchState(
+        cam("c1", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+      ),
+    ).toBe("on");
+  });
+
+  it("视频 + 音频 都关 → off", () => {
+    expect(
+      masterSwitchState(
+        cam("c1", { videoEnabled: false, audioEnabled: false, isOnline: true }),
+      ),
+    ).toBe("off");
+  });
+
+  it("仅视频开 → mid", () => {
+    expect(
+      masterSwitchState(
+        cam("c1", { videoEnabled: true, audioEnabled: false, isOnline: true }),
+      ),
+    ).toBe("mid");
+  });
+
+  it("仅音频开 → mid", () => {
+    expect(
+      masterSwitchState(
+        cam("c1", { videoEnabled: false, audioEnabled: true, isOnline: true }),
+      ),
+    ).toBe("mid");
+  });
+
+  it("in_use=false 与音视频独立判定——master 看 video/audio,不看 inUse", () => {
+    expect(
+      masterSwitchState(
+        cam("c1", {
+          inUse: false,
+          videoEnabled: true,
+          audioEnabled: true,
+          isOnline: true,
+        }),
+      ),
+    ).toBe("on");
+  });
+});
+
+describe("bulkMasterEnableDisabled", () => {
+  it("无在线相机 → disabled（无可作用相机）", () => {
+    expect(
+      bulkMasterEnableDisabled([cam("c1", { isOnline: false })]),
+    ).toBe(true);
+  });
+
+  it("所有在线都 on → disabled（无可启的）", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+      cam("c2", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+    ];
+    expect(bulkMasterEnableDisabled(cameras)).toBe(true);
+  });
+
+  it("任一在线 mid（不一致）→ 可点（mid 推 on）", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+      cam("c2", { videoEnabled: true, audioEnabled: false, isOnline: true }), // mid
+    ];
+    expect(bulkMasterEnableDisabled(cameras)).toBe(false);
+  });
+
+  it("任一在线 off → 可点", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+      cam("c2", { videoEnabled: false, audioEnabled: false, isOnline: true }),
+    ];
+    expect(bulkMasterEnableDisabled(cameras)).toBe(false);
+  });
+
+  it("离线相机不参与 — 都 on 则 disabled", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+      cam("c2", { videoEnabled: false, audioEnabled: false, isOnline: false }),
+    ];
+    expect(bulkMasterEnableDisabled(cameras)).toBe(true);
+  });
+});
+
+describe("bulkMasterDisableDisabled", () => {
+  it("所有在线都 off → disabled（无可禁的）", () => {
+    expect(
+      bulkMasterDisableDisabled([
+        cam("c1", { videoEnabled: false, audioEnabled: false, isOnline: true }),
+      ]),
+    ).toBe(true);
+  });
+
+  it("任一在线 mid → 可点（mid 推 off）", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: false, audioEnabled: false, isOnline: true }),
+      cam("c2", { videoEnabled: true, audioEnabled: false, isOnline: true }),
+    ];
+    expect(bulkMasterDisableDisabled(cameras)).toBe(false);
+  });
+
+  it("任一在线 on → 可点", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: false, audioEnabled: false, isOnline: true }),
+      cam("c2", { videoEnabled: true, audioEnabled: true, isOnline: true }),
+    ];
+    expect(bulkMasterDisableDisabled(cameras)).toBe(false);
+  });
+
+  it("离线相机不参与 — 都 off 则 disabled", () => {
+    const cameras = [
+      cam("c1", { videoEnabled: false, audioEnabled: false, isOnline: true }),
+      cam("c2", { videoEnabled: true, audioEnabled: true, isOnline: false }),
+    ];
+    expect(bulkMasterDisableDisabled(cameras)).toBe(true);
   });
 });

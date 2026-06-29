@@ -1,14 +1,25 @@
 /**
- * 感知设备列表（per-camera × per-modality 矩阵）
+ * 感知设备列表（per-camera × per-modality，状态展示 + 操作分列）
  *
- * 位置：HeroNow 下方，替代 v1 的「miloco 未感知设备」benchCams 列表。
+ * 列布局（v3 重构）：
+ *   设备 | 视频感知 | 音频感知 | 操作
+ *                          ├─ 视频开关
+ *                          ├─ 音频开关
+ *                          └─ 整设备主开关（视频+音频一键 ON/OFF）
  *
- * 行为：
- * - 始终列出所有米家摄像头（含离线 / 全关）
- * - 每行两路开关：摄像头感知（video）+ 音频感知（audio）
- * - 顶部 4 个批量按钮：全部开启视频 / 全部关闭视频 / 全部开启音频 / 全部关闭音频
- * - 离线相机行灰显、toggle 禁用（与 miot toggle_camera 上限校验同口径）
- * - 离线相机不参与批量按钮的范围
+ * 主开关行为：
+ * - on  ↔  视频 + 音频 都启用
+ * - off ↔  视频 + 音频 都禁用
+ * - mid ↔  二者状态不一致（视觉上一中杠标识，用户可一键回滚）
+ * - 点击主开关:
+ *     - 当前 on / mid → 都关
+ *     - 当前 off → 都开
+ *
+ * 列表范围：所有米家摄像头（含离线 / 全关 / 已超 MAX_ENABLED 上限的），
+ *           替代 v1 的「未感知设备」benchCams 列表。
+ * 离线相机行灰显，所有 toggle 禁用（与 miot toggle_camera 上限同口径）。
+ *
+ * 顶部批量按钮：4 个模态级（视频 on/off / 音频 on/off）+ 2 个主开关级（全员启/暂停）。
  */
 
 import { useMemo, useState } from "react";
@@ -19,6 +30,17 @@ import {
   type CameraToggleItem,
 } from "@/api";
 import { toast } from "./Toast";
+import {
+  sortCamerasByDid,
+  onlineCameras as onlineCamerasFn,
+  bulkEnableDisabled,
+  bulkDisableDisabled,
+  rowToggleDisabled,
+  masterSwitchState,
+  type MasterState,
+  bulkMasterEnableDisabled,
+  bulkMasterDisableDisabled,
+} from "./PerceptionDeviceTable.helpers";
 
 interface Props {
   cameras: ScopeCamera[];
@@ -32,16 +54,8 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
   const [singleBusy, setSingleBusy] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
 
-  const sorted = useMemo(
-    () => [...cameras].sort((a, b) => a.did < b.did ? -1 : a.did > b.did ? 1 : 0),
-    [cameras],
-  );
-
-  // 批量按钮范围 = 在线相机（离线无法 enable,跟 miot toggle_camera 同口径）
-  const onlineCameras = useMemo(
-    () => sorted.filter((c) => c.isOnline),
-    [sorted],
-  );
+  const sorted = useMemo(() => sortCamerasByDid(cameras), [cameras]);
+  const online = useMemo(() => onlineCamerasFn(cameras), [cameras]);
 
   const runSingle = async (
     did: string,
@@ -68,15 +82,42 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
     }
   };
 
-  const runBulk = async (modality: Modality, next: boolean) => {
+  /** 主开关:on/mid → 全关;off → 全开 */
+  const runMaster = async (c: ScopeCamera) => {
+    if (bulkBusy || singleBusy.has(c.did) || rowToggleDisabled(c)) return;
+    const nextEnabled = !(c.videoEnabled || c.audioEnabled);
+    // "next" 已经被推上:off → next=true (全开);on/mid → next=false (全关)
+    // 注:与单纯视频/音频切换不同,主开关不动 inUse(整体入网状态),只动模态位
+    //    ——因为 disable 整相机感知等价于 inUse=false 但语义更细。
+    setSingleBusy((s) => new Set(s).add(c.did));
+    try {
+      await toggleScopeCamera([
+        { did: c.did, videoEnabled: nextEnabled, audioEnabled: nextEnabled },
+      ]);
+      onChanged();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : t("common.switchFailed"), "warn");
+    } finally {
+      setSingleBusy((s) => {
+        const n = new Set(s);
+        n.delete(c.did);
+        return n;
+      });
+    }
+  };
+
+  const runBulk = async (kind: "video" | "audio" | "master", next: boolean) => {
     if (bulkBusy) return;
     setBulkBusy(true);
     try {
-      const items: CameraToggleItem[] = onlineCameras.map((c) =>
-        modality === "video"
+      const items: CameraToggleItem[] = online.map((c) => {
+        if (kind === "master") {
+          return { did: c.did, videoEnabled: next, audioEnabled: next };
+        }
+        return kind === "video"
           ? { did: c.did, videoEnabled: next }
-          : { did: c.did, audioEnabled: next },
-      );
+          : { did: c.did, audioEnabled: next };
+      });
       await toggleScopeCamera(items);
       onChanged();
     } catch (e) {
@@ -105,23 +146,33 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
           <div className="flex flex-wrap items-center gap-2">
             <BulkButton
               label={t("hero.table.bulkVideoAllOn")}
-              disabled={bulkBusy || onlineCameras.every((c) => c.videoEnabled)}
+              disabled={bulkBusy || bulkEnableDisabled(cameras, "video")}
               onClick={() => runBulk("video", true)}
             />
             <BulkButton
               label={t("hero.table.bulkVideoAllOff")}
-              disabled={bulkBusy || onlineCameras.every((c) => !c.videoEnabled)}
+              disabled={bulkBusy || bulkDisableDisabled(cameras, "video")}
               onClick={() => runBulk("video", false)}
             />
             <BulkButton
               label={t("hero.table.bulkAudioAllOn")}
-              disabled={bulkBusy || onlineCameras.every((c) => c.audioEnabled)}
+              disabled={bulkBusy || bulkEnableDisabled(cameras, "audio")}
               onClick={() => runBulk("audio", true)}
             />
             <BulkButton
               label={t("hero.table.bulkAudioAllOff")}
-              disabled={bulkBusy || onlineCameras.every((c) => !c.audioEnabled)}
+              disabled={bulkBusy || bulkDisableDisabled(cameras, "audio")}
               onClick={() => runBulk("audio", false)}
+            />
+            <BulkButton
+              label={t("hero.table.bulkMasterAllOn")}
+              disabled={bulkBusy || bulkMasterEnableDisabled(cameras)}
+              onClick={() => runBulk("master", true)}
+            />
+            <BulkButton
+              label={t("hero.table.bulkMasterAllOff")}
+              disabled={bulkBusy || bulkMasterDisableDisabled(cameras)}
+              onClick={() => runBulk("master", false)}
             />
           </div>
         )}
@@ -139,10 +190,7 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
                 <th className="text-left font-normal px-5 py-2">
                   {t("hero.table.headerDevice")}
                 </th>
-                <th className="text-left font-normal px-3 py-2 hidden sm:table-cell">
-                  {t("hero.table.headerRoom")}
-                </th>
-                <th className="text-center font-normal px-3 py-2">
+                <th className="text-center font-normal px-3 py-2 hidden sm:table-cell">
                   {t("hero.table.headerVideo")}
                 </th>
                 <th className="text-center font-normal px-3 py-2">
@@ -155,8 +203,9 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
             </thead>
             <tbody>
               {sorted.map((c) => {
-                const offline = !c.isOnline;
+                const offline = rowToggleDisabled(c);
                 const busy = bulkBusy || singleBusy.has(c.did);
+                const master = masterSwitchState(c);
                 return (
                   <tr
                     key={c.did}
@@ -164,49 +213,67 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
                       offline ? "opacity-50" : ""
                     }`}
                   >
+                    {/* 设备列:名称 + (room/离线) subline */}
                     <td className="px-5 py-3">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-baseline gap-2">
                         <span className="text-text-primary truncate">
                           {c.name}
                         </span>
-                        {offline && (
-                          <span className="text-caption text-warning shrink-0">
-                            · {t("hero.table.offlineHint")}
+                        {c.roomName && (
+                          <span className="text-caption text-text-tertiary truncate">
+                            · {c.roomName}
                           </span>
                         )}
                       </div>
-                      {/* mobile: room 跟在名字下方 */}
-                      {c.roomName && (
-                        <div className="text-caption text-text-tertiary truncate sm:hidden">
-                          {c.roomName}
+                      {offline && (
+                        <div className="text-caption text-warning mt-0.5">
+                          {t("hero.table.offlineHint")}
                         </div>
                       )}
                     </td>
-                    <td className="px-3 py-3 text-text-secondary truncate hidden sm:table-cell">
-                      {c.roomName ?? ""}
-                    </td>
-                    <td className="px-3 py-3 text-center">
-                      <ModalitySwitch
-                        checked={c.videoEnabled}
-                        disabled={offline || busy}
-                        onChange={(next) => runSingle(c.did, "video", next)}
-                        ariaLabel={c.name}
-                        modality="video"
+
+                    {/* 视频感知 状态列 */}
+                    <td className="px-3 py-3 text-center hidden sm:table-cell">
+                      <StateBadge
+                        kind="video"
+                        enabled={c.videoEnabled}
+                        offline={offline}
                       />
                     </td>
+
+                    {/* 音频感知 状态列 */}
                     <td className="px-3 py-3 text-center">
-                      <ModalitySwitch
-                        checked={c.audioEnabled}
-                        disabled={offline || busy}
-                        onChange={(next) => runSingle(c.did, "audio", next)}
-                        ariaLabel={c.name}
-                        modality="audio"
+                      <StateBadge
+                        kind="audio"
+                        enabled={c.audioEnabled}
+                        offline={offline}
                       />
                     </td>
-                    <td className="px-5 py-3 text-right">
-                      <span className="text-caption text-text-tertiary">
-                        {offline ? "—" : c.connected ? "LIVE" : ""}
-                      </span>
+
+                    {/* 操作列:3 个 toggle */}
+                    <td className="px-5 py-3">
+                      <div className="flex items-center justify-end gap-3 flex-wrap">
+                        <ModalitySwitch
+                          checked={c.videoEnabled}
+                          disabled={offline || busy}
+                          onChange={(next) => runSingle(c.did, "video", next)}
+                          ariaLabel={`${c.name} · ${t("hero.table.headerVideo")}`}
+                          modality="video"
+                        />
+                        <ModalitySwitch
+                          checked={c.audioEnabled}
+                          disabled={offline || busy}
+                          onChange={(next) => runSingle(c.did, "audio", next)}
+                          ariaLabel={`${c.name} · ${t("hero.table.headerAudio")}`}
+                          modality="audio"
+                        />
+                        <MasterSwitch
+                          state={master}
+                          disabled={offline || busy}
+                          onClick={() => runMaster(c)}
+                          ariaLabel={`${c.name} · ${t("hero.table.headerMaster")}`}
+                        />
+                      </div>
                     </td>
                   </tr>
                 );
@@ -218,6 +285,8 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
     </section>
   );
 }
+
+/* ── 子组件 ─────────────────────────────────────────────── */
 
 function BulkButton({
   label,
@@ -240,12 +309,45 @@ function BulkButton({
   );
 }
 
+/** 状态徽章:● ON / ○ OFF / ─ 离线 / ◐ mid（主开关专用）。 */
+function StateBadge({
+  kind,
+  enabled,
+  offline,
+}: {
+  kind: "video" | "audio";
+  enabled: boolean;
+  offline: boolean;
+}) {
+  if (offline) {
+    return (
+      <span className="text-caption text-text-tertiary" aria-label="unavailable">
+        —
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 text-caption ${
+        enabled ? "text-brand-primary" : "text-text-tertiary"
+      }`}
+      aria-label={kind === "video" ? "video" : "audio"}
+    >
+      <span
+        className={`inline-block h-2 w-2 rounded-full ${
+          enabled ? "bg-brand-primary" : "bg-text-tertiary"
+        }`}
+      />
+      {enabled ? "ON" : "OFF"}
+    </span>
+  );
+}
+
 function ModalitySwitch({
   checked,
   disabled,
   onChange,
   ariaLabel,
-  modality,
 }: {
   checked: boolean;
   disabled: boolean;
@@ -260,7 +362,7 @@ function ModalitySwitch({
       type="button"
       role="switch"
       aria-checked={checked}
-      aria-label={`${modality === "video" ? t("hero.table.headerVideo") : t("hero.table.headerAudio")} · ${ariaLabel}`}
+      aria-label={`${ariaLabel} · ${labelText}`}
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`relative inline-flex h-[14px] w-[26px] shrink-0 rounded-full transition-colors shadow-sm focus-visible:ring-2 focus-visible:ring-brand-primary focus-visible:outline-none disabled:opacity-40 disabled:cursor-not-allowed ${
@@ -273,6 +375,64 @@ function ModalitySwitch({
         }`}
       />
       <span className="sr-only">{labelText}</span>
+    </button>
+  );
+}
+
+/**
+ * 整设备主开关 — 三态 on / off / mid
+ *
+ * - 点击:on/mid → 都关;off → 都开(等价于向 backend 发一对 video=audio=next 的 PUT)
+ * - 视觉:on 同 ModalitySwitch;off 同;mid 在圆点位置覆盖一短横杠"半开"
+ */
+function MasterSwitch({
+  state,
+  disabled,
+  onClick,
+  ariaLabel,
+}: {
+  state: MasterState;
+  disabled: boolean;
+  onClick: () => void;
+  ariaLabel: string;
+}) {
+  const { t } = useTranslation();
+  const isOn = state === "on";
+  const isMid = state === "mid";
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={isOn}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={onClick}
+      title={t(
+        isOn
+          ? "hero.table.masterHintOn"
+          : isMid
+          ? "hero.table.masterHintMid"
+          : "hero.table.masterHintOff",
+      )}
+      className={`relative inline-flex h-[14px] w-[26px] shrink-0 rounded-full transition-colors shadow-sm focus-visible:ring-2 focus-visible:ring-brand-primary focus-visible:outline-none disabled:opacity-40 disabled:cursor-not-allowed ${
+        isOn ? "bg-brand-primary" : "bg-black/60"
+      }`}
+    >
+      {isMid ? (
+        <span
+          className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 inline-block h-[2px] w-3 rounded-full bg-white"
+          aria-hidden
+        />
+      ) : (
+        <span
+          className={`absolute top-0.5 left-0.5 inline-block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform ${
+            isOn ? "translate-x-[12px]" : "translate-x-0"
+          }`}
+        />
+      )}
+      <span className="sr-only">
+        {isOn ? t("hero.table.masterOnLabel") : t("hero.table.masterOffLabel")}
+      </span>
     </button>
   );
 }
