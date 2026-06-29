@@ -17,6 +17,7 @@ from miloco.observability.context import get_device_context
 from miloco.observability.omni_log import publish_omni_log
 from miloco.perception.engine.config import OmniConfig
 from miloco.perception.engine.omni.constants import MILOCO_USER_AGENT
+from miloco.perception.engine.providers import OmniProvider, get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,14 @@ async def call_omni(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    messages = _build_messages(payload)
+    # v3: provider 决定 video/audio block 形态 + 可能的额外 request 字段。
+    # PR1 默认 OpenAI 兼容 provider, request_kwargs 返回 {} 行为不变。
+    # ``declared`` 是 PR3 才接 OmniConfig.provider 字段的 hook；PR1 用 getattr
+    # 容错, 永远 None 走 Layer 2/3 自动检测 (当前 1:1 行为)。
+    provider = get_provider(
+        config.base_url, declared=getattr(config, "declared_provider", None)
+    )
+    messages = _build_messages(payload, provider)
 
     body: dict[str, Any] = {
         "model": config.model,
@@ -156,6 +164,7 @@ async def call_omni(
         "stream": False,
         "thinking": {"type": "disabled"},
     }
+    body.update(provider.request_kwargs(payload, fps=payload.get("video_fps", 3)))
 
     t0 = time.monotonic()
     raw: dict[str, Any] | None = None
@@ -196,33 +205,36 @@ async def call_omni(
         )
 
 
-def _build_messages(payload: dict) -> list[dict]:
+def _build_messages(payload: dict, provider: OmniProvider, sample_rate: int = 16000) -> list[dict]:
+    """构造 messages。
+
+    v3 修订: video/audio block 形态由 provider 决定(替代原来 hardcode 的
+    video_url / input_audio 形态)。
+    """
     messages: list[dict] = [{"role": "system", "content": payload["system_prompt"]}]
 
     content: list[dict] = [{"type": "text", "text": payload["user_content"]}]
 
     # Video (frames + audio merged into mp4)；与 audio_base64 互斥（上游 _build_payload 保证）
     if payload.get("video_base64"):
-        content.append(
-            {
-                "type": "video_url",
-                "video_url": {
-                    "url": f"data:video/mp4;base64,{payload['video_base64']}"
-                },
-                "fps": payload.get("video_fps", 3),
-                "media_resolution": "max",
-            }
+        video_block = provider.video_block(
+            video_b64=payload["video_base64"],
+            fps=payload.get("video_fps", 3),
+            # PR1: OpenAI 兼容 provider 不 merge audio, audio_b64=None。
+            # PR2 (MiniMax): 这里会传 audio_b64, provider 用 ffmpeg mux。
+            audio_b64=None,
+            audio_sample_rate=sample_rate,
         )
-    # Audio-only route：独立 input_audio 块（仅当无 video_base64 时启用）
+        if video_block is not None:
+            content.append(video_block)
+    # Audio-only route：独立 audio 块（仅当无 video_base64 时启用）
     elif payload.get("audio_base64"):
-        content.append(
-            {
-                "type": "input_audio",
-                "input_audio": {
-                    "data": f"data:audio/m4a;base64,{payload['audio_base64']}"
-                },
-            }
+        audio_block = provider.audio_block(
+            audio_b64=payload["audio_base64"],
+            sample_rate=sample_rate,
         )
+        if audio_block is not None:
+            content.append(audio_block)
 
     # Crop images (from tracker)
     for crop in payload.get("crops", []):
@@ -319,7 +331,14 @@ async def call_omni_stream(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    messages = _build_messages(payload)
+    # v3: provider 决定 video/audio block 形态 + 可能的额外 request 字段。
+    # PR1 默认 OpenAI 兼容 provider, request_kwargs 返回 {} 行为不变。
+    # ``declared`` 是 PR3 才接 OmniConfig.provider 字段的 hook；PR1 用 getattr
+    # 容错, 永远 None 走 Layer 2/3 自动检测 (当前 1:1 行为)。
+    provider = get_provider(
+        config.base_url, declared=getattr(config, "declared_provider", None)
+    )
+    messages = _build_messages(payload, provider)
 
     body: dict[str, Any] = {
         "model": config.model,
@@ -331,6 +350,7 @@ async def call_omni_stream(
         "stream_options": {"include_usage": True},
         "thinking": {"type": "disabled"},
     }
+    body.update(provider.request_kwargs(payload, fps=payload.get("video_fps", 3)))
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",

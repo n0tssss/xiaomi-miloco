@@ -32,6 +32,7 @@ from miloco.perception.engine.identity.gallery_composite import (
     encode_png_bytes,
     hstack_to_height,
 )
+from miloco.perception.engine.providers import OmniProvider, get_provider
 from miloco.perception.engine.types import IdentityPacket, IdentityTarget, OmniContext
 
 from .constants import (
@@ -169,6 +170,8 @@ def build_fused_payload(
     gallery_snapshot: dict[str, "GallerySamples"],
     config: FusedPromptConfig | None = None,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    provider: OmniProvider | None = None,
 ) -> dict:
     """构造 fused 主调用的 payload（身份识别和场景理解合并到同一次 omni 调用）。
 
@@ -265,6 +268,7 @@ def build_fused_payload(
         video_fps=fps,
         cfg=cfg,
         label_lookup=label_lookup,
+        provider=provider,
     )
 
     messages = _assemble_fused_messages(
@@ -558,6 +562,7 @@ def _build_fused_user_content(
     video_fps: int,
     cfg: FusedPromptConfig,
     label_lookup: "dict[str, str] | None" = None,
+    provider: OmniProvider | None = None,
 ) -> list[dict]:
     """构建 user 消息的 content 列表（text/image_url/video_url 块交错）。
 
@@ -674,17 +679,26 @@ def _build_fused_user_content(
     # 5. 主 video
     # video_b64 size sanity check — PyAV 编码异常情况下可能返回非空但损坏的极短
     # base64 串, 入 payload 会让 omni 服务端 400 Multimodal data is corrupted。
-    # 太短 → 跳过 video_url 块, 退化为"无视频窗口"(text + gallery 仍能识别)。
+    # 太短 → 跳过 video 块, 退化为"无视频窗口"(text + gallery 仍能识别)。
+    #
+    # v3 修订: video block 形态由 provider.video_block() 决定(provider 抽象)。
+    # PR1 默认 OpenAI 兼容 provider,行为完全一致(原 hardcode 是 video_url + fps
+    # 外层 + media_resolution)。PR2 MiniMax provider 会改成 type=video + fps 内嵌。
     if video_b64 and len(video_b64) >= _MIN_VIDEO_B64_LEN:
-        content.append({
-            "type": "video_url",
-            "video_url": {"url": f"data:video/mp4;base64,{video_b64}"},
-            "fps": video_fps,
-            "media_resolution": "max",
-        })
+        p = provider or get_provider("", declared="openai")
+        # 传给 video_block 的 audio_b64 在 PR1 永远 None (OpenAI 不 merge)。
+        # PR2 (MiniMax) 会传 PCM 让它 ffmpeg mux 进 video 流。
+        video_block = p.video_block(
+            video_b64=video_b64,
+            fps=video_fps,
+            audio_b64=None,
+            audio_sample_rate=16000,
+        )
+        if video_block is not None:
+            content.append(video_block)
     elif video_b64:
         logger.warning(
-            "event=fused_video_b64_too_short size=%d (< %d), 跳过 video_url 块, "
+            "event=fused_video_b64_too_short size=%d (< %d), 跳过 video 块, "
             "本窗口走 text-only 识别",
             len(video_b64), _MIN_VIDEO_B64_LEN,
         )
