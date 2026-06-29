@@ -10,20 +10,13 @@ metadata:
 
 把 Miloco 装到一台**已经装了 Hermes Agent** 的机器上。Hermes 兼容层在 fork `n0tssss/xiaomi-miloco` 的 `plugins/hermes/` 下。
 
-**安装方式**：
-
-```bash
-git clone https://github.com/n0tssss/xiaomi-miloco.git
-cd xiaomi-miloco
-bash plugins/hermes/install-hermes.sh
-hermes gateway restart
-```
-
 > **Windows 用户：** 当前不支持原生 Windows，请先装 [WSL](https://learn.microsoft.com/zh-cn/windows/wsl/install)，在 WSL 终端中执行。
+
+> **agent 是主操作员**：下面 4 步里 agent 自跑命令、不需要用户在终端复制粘贴（**唯一例外 Step 3 重启 gateway**，Hermes 有 anti-restart-loop，agent 不能代跑，下面会标出来）。
 
 ---
 
-## Step 1：装插件
+## Step 1：装插件（agent 自跑）
 
 ```bash
 git clone https://github.com/n0tssss/xiaomi-miloco.git
@@ -33,7 +26,7 @@ bash plugins/hermes/install-hermes.sh
 
 脚本会自动：依赖检查、Bearer 复用、16 skill 同步、插件 + adapter 安装、IM 探测、config.json patch、adapter 启动、plugin enable、版本记录。
 
-成功标志：脚本打印 `mark_done 9` 且 exit 0。如果 exit ≠ 0，看 stderr + 翻底部故障排除表。脚本自带 `--diagnose` 子命令可重跑 12 项自检。
+成功标志：脚本打印 `mark_done 9` 且 exit 0。如果 exit ≠ 0，贴 stderr + 翻底部故障排除表。脚本自带 `--diagnose` 子命令可重跑 12 项自检。重复跑 install-hermes.sh 是幂等的。
 
 ---
 
