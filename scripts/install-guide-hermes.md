@@ -201,6 +201,14 @@ miloco-cli account status
 
 ### 2.2 Omni 模型
 
+**⚠ 强制前置：模型必须支持视频/图像输入。** 感知引擎把摄像头画面当 input 发给 Omni 模型；纯文本模型（`gpt-3.5-turbo` / `MiniMax-M3` / `abab-5.5-chat` 等）装上去 `/health` 还显示 ok 但 perceive query 永远 1000。**agent 不要让任何纯文本模型进 config.json。**
+
+**已知纯文本模型（命中必须警告用户，不能进 2.3）**：
+- `MiniMax-M3` ← 最常被误选（agent 看到"MiniMax + 名字短"就默认它）
+- 其他 `MiniMax-M*` / `abab-5.5*` / `gpt-3.5-turbo` / `<vendor>-text-*` 一律当文本处理
+
+**已知多模态模型（OK 让它过）**：`mimo-v2.5` / `gpt-4o*` / `claude-3-5-*` / `gemini-1.5-pro` / `gemini-2.0-flash*` / `MiniMax-VL-01` / `abab-6.5s-chat`
+
 **agent 跑一下确认状态**（一次发三条命令，结果分三段看）：
 
 ```bash
@@ -211,45 +219,90 @@ miloco-cli config get model.omni.base_url
 
 **判定**：
 
-- **三项都非空**（api_key 不为 null 且 model/base_url 不为 null）→ 进 2.3，或者发一句"模型已配，跳到重启 gateway"。
+- **model 名命中已知纯文本黑名单**（`-M3` / `-text` / `gpt-3.5*` / `abab-5.5*` 等）→ **不进 2.3**，直接告诉用户：
+
+  > ⚠ 当前 model.omni.model = `<xxx>` 是纯文本模型，感知引擎不能用。请换一个支持视觉/视频的模型：
+  > - 默认 MiMo（多模态）：`miloco-cli config set model.omni.api_key <你的_MiMo_Key>`（model/base_url 用默认 `mimo-v2.5` / `https://api.xiaomimimo.com/v1`）
+  > - 或 OpenAI 多模态：`miloco-cli config set model.omni.model gpt-4o model.omni.base_url https://api.openai.com/v1 model.omni.api_key sk-xxx`
+  > - 或上面"已知多模态模型"列表里任一个
+  >
+  > 跑完告诉我「配好了」。
+
+- **三项都非空 + model 名不在纯文本黑名单** → 走 2.2 验证 step（看下面），进 2.3。
 - **任一项为 null / 报错** → 发下面这整段（**一次发完**就停下等用户回）：
 
-> 下一步要配 Omni 模型（感知引擎用），二选一：
->
-> **A. 默认小米 MiMo**（推荐）
->
-> key 从 https://platform.xiaomimimo.com 拿。然后你自己终端跑：
->
-> ```bash
-> miloco-cli config set model.omni.api_key <你的_MiMo_Key>
-> ```
->
-> （model = `xiaomi/mimo-v2.5`、base_url = `https://api.xiaomimimo.com/v1` 是默认值，不用设）
->
-> **B. 第三方**（OpenAI / Anthropic / 自建 / 任何 OpenAI 兼容 API）
->
-> 你自己终端跑（一次写完三项）：
->
-> ```bash
-> miloco-cli config set model.omni.model <model_name> model.omni.base_url <base_url> model.omni.api_key <api_key>
-> ```
->
-> 例（用 OpenAI）：
->
-> ```bash
-> miloco-cli config set model.omni.model gpt-4o model.omni.base_url https://api.openai.com/v1 model.omni.api_key sk-xxx
-> ```
->
-> 跑完告诉我「配好了」我接着重启 gateway。
+  > 下一步要配 Omni 模型（感知引擎用），二选一：
+  >
+  > **A. 默认小米 MiMo**（推荐，多模态）
+  >
+  > key 从 https://platform.xiaomimimo.com 拿。然后你自己终端跑：
+  >
+  > ```bash
+  > miloco-cli config set model.omni.api_key <你的_MiMo_Key>
+  > ```
+  >
+  > （model = `mimo-v2.5`、base_url = `https://api.xiaomimimo.com/v1` 是默认值，不用设）
+  >
+  > **B. 第三方多模态**（OpenAI / Anthropic / 自建 / 任何 OpenAI 兼容 API）
+  >
+  > 你自己终端跑（一次写完三项）：
+  >
+  > ```bash
+  > miloco-cli config set model.omni.model <model_name> model.omni.base_url <base_url> model.omni.api_key <api_key>
+  > ```
+  >
+  > 例（用 OpenAI）：
+  >
+  > ```bash
+  > miloco-cli config set model.omni.model gpt-4o model.omni.base_url https://api.openai.com/v1 model.omni.api_key sk-xxx
+  > ```
+  >
+  > ⚠ 别用 `MiniMax-M3` / `abab-5.5-chat` / `gpt-3.5-turbo` 这些纯文本模型名——装上感知引擎会 1000。
+  >
+  > 跑完告诉我「配好了」我接着重启 gateway。
 
-**用户回「配好了」/「好了」/「ok」之类 → agent 验证**：
+**用户回「配好了」/「好了」/「ok」之类 → agent 验证（两步）**：
+
+**Step 2.2.1：基础验证 + 黑名单校验**
 
 ```bash
 miloco-cli config get model.omni.api_key
+miloco-cli config get model.omni.model
 ```
 
-- 验证通过（api_key 不为 null）→ 进 2.3。
-- 验证失败 → 贴 stderr 给用户 + 提示「是不是粘错了 / 是不是少粘了 base64 后面的等号」之类，让他重跑。
+- api_key 非空 + model 名通过黑名单 → 走 2.2.2。
+- 任一失败 → 贴 stderr 给用户 + 按上面"判定"分支处理。
+
+**Step 2.2.2：能力探测（轻量 capability probe）**
+
+确认模型**真**接受多模态输入（不是只看名字）。发一个最小图片请求看 HTTP code：
+
+```bash
+# 1x1 透明 png base64（约 70 字节）
+PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+
+PROBE_CODE=$(curl -sS -o /tmp/miloco_probe.txt -w "%{http_code}" \
+  -H "Authorization: Bearer $(miloco-cli config get model.omni.api_key | tr -d '"')" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"'"$(miloco-cli config get model.omni.model | tr -d '"')"'","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,'"$PNG_B64"'"}}]}],"max_tokens":10}' \
+  "$(miloco-cli config get model.omni.base_url | tr -d '"')/chat/completions" 2>&1)
+
+if [ "$PROBE_CODE" = "200" ]; then
+  echo "  ✓ 模型接受图像输入，进 2.3"
+elif echo "$PROBE_CODE" | grep -qE '^4'; then
+  echo "  ✗ 模型 HTTP $PROBE_CODE 不接受多模态输入（典型：纯文本模型或名/URL 不匹配）"
+  echo "    失败响应 body 摘要：$(head -c 300 /tmp/miloco_probe.txt 2>/dev/null)"
+  echo "    → 重设 model.omni.model 为多模态模型名，重跑 2.2"
+  exit 1
+else
+  echo "  ⚠ 探测失败（HTTP $PROBE_CODE，可能是网络/key 问题），先排查再继续"
+  exit 1
+fi
+```
+
+- 200 → 进 2.3。
+- 4xx → 拒绝继续；告诉用户「模型不接受视频/图像输入」+ 列出上面"已知多模态模型"让他挑一个 + 跑完重设 2.2。
+- 5xx / curl err → 失败贴 stderr，让用户先排查 key / 网络 / base_url，再继续。
 
 ### 2.3 重启 Hermes gateway
 
