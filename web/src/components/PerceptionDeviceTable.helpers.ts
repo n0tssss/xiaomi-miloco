@@ -46,3 +46,31 @@ export function bulkDisableDisabled(
 export function rowToggleDisabled(camera: ScopeCamera): boolean {
   return !camera.isOnline;
 }
+
+/* ── master switch (整设备启停) ──────────────────────────── */
+
+/** 三态:on (video+audio 都开) / mid (二者不一致) / off (都关) */
+export type MasterState = "on" | "mid" | "off";
+
+export function masterSwitchState(camera: ScopeCamera): MasterState {
+  if (camera.videoEnabled && camera.audioEnabled) return "on";
+  if (!camera.videoEnabled && !camera.audioEnabled) return "off";
+  return "mid";
+}
+
+/**
+ * 一键"全员启感知"按钮:无在线相机 OR 所有在线相机都"全 on"时置灰。
+ * (mid 状态的相机算未启——批量 on 应该把所有 mid 推到 on)
+ */
+export function bulkMasterEnableDisabled(cameras: ScopeCamera[]): boolean {
+  const online = onlineCameras(cameras);
+  if (online.length === 0) return true;
+  return online.every((c) => masterSwitchState(c) === "on");
+}
+
+/** 一键"全员暂停感知":所有在线都"全 off"时置灰(mid 不算全 off)。 */
+export function bulkMasterDisableDisabled(cameras: ScopeCamera[]): boolean {
+  const online = onlineCameras(cameras);
+  if (online.length === 0) return true;
+  return online.every((c) => masterSwitchState(c) === "off");
+}
