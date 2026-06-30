@@ -84,14 +84,26 @@ class OmniProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def request_kwargs(self, payload: dict, fps: int) -> dict:
-        """返回 HTTP request 级别的额外参数(model / stream / thinking 等)。
+    def request_kwargs(
+        self,
+        payload: dict,
+        fps: int,
+        *,
+        user_max_tokens: int = 1024,
+    ) -> dict:
+        """返回 HTTP request 级别的额外参数(model / stream / thinking / max_tokens 等)。
 
         不同 provider 在 wire format 之外的 request envelope 也可能不同,
         例如某些 provider 不支持 stream,某些需要特殊的 thinking 字段等。
-        给 provider 自由定制整个 body 的能力。
+        **envelope 字段(thinking / max_tokens / stream)由 provider 完全控制**——
+        caller 不预设,见 omni_client.py ``body.update(provider.request_kwargs(...))`` 注释。
 
-        返回 {} 表示没有额外参数,caller 沿用默认 envelope。
+        ``user_max_tokens`` 是 user 在 ``model.omni.max_completion_tokens`` 配置的值,
+        provider 可继承(原值照用)或 override(改大改小)。例如:
+        - OpenAI/MiMo: 继承 ``user_max_tokens``
+        - MiniMax-M3 (thinking-on): 自行加 budget_tokens 字段,override max_tokens 至少 4096
+
+        返回 {} 表示没有额外参数,caller 沿用 body 默认 envelope。
         """
         raise NotImplementedError
 

@@ -158,16 +158,21 @@ async def call_omni(
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
-        "max_tokens": config.max_completion_tokens,
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": False,
-        # thinking 这类 envelope 字段由 provider.request_kwargs() 决定(PR3 设计)
-        # caller 不预设 — 否则会跟未来 MiniMaxProvider 这种 thinking-on 模型冲突
-        # （MiniMax-M3 是 thinking 模型,hardcode disabled 会逼模型挤 512 token 完成
-        # 思考 + 结构化 JSON,JSON 被截断导致 answer 为空）
+        # envelope 字段(thinking / max_tokens / stream 等)全部由
+        # provider.request_kwargs() 决定(PR3 设计)—— caller 不预设任何 envelope,
+        # 只留 model / messages / temperature / top_p 这种语义中性字段。
+        # max_tokens 走 provider,provider 继承 user 配置或 override(thinking 模型)。
     }
-    body.update(provider.request_kwargs(payload, fps=payload.get("video_fps", 3)))
+    body.update(
+        provider.request_kwargs(
+            payload,
+            fps=payload.get("video_fps", 3),
+            user_max_tokens=config.max_completion_tokens,
+        )
+    )
 
     t0 = time.monotonic()
     raw: dict[str, Any] | None = None
@@ -346,14 +351,20 @@ async def call_omni_stream(
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
-        "max_tokens": config.max_completion_tokens,
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": True,
         "stream_options": {"include_usage": True},
-        # thinking envelope 字段由 provider.request_kwargs() 控制(同上)
+        # envelope 字段(thinking / max_tokens / stream 等)全部由
+        # provider.request_kwargs() 决定(同上,见 omni_client.py:158 注释)
     }
-    body.update(provider.request_kwargs(payload, fps=payload.get("video_fps", 3)))
+    body.update(
+        provider.request_kwargs(
+            payload,
+            fps=payload.get("video_fps", 3),
+            user_max_tokens=config.max_completion_tokens,
+        )
+    )
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",

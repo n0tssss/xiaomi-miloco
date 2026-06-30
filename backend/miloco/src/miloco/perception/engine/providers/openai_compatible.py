@@ -72,17 +72,24 @@ class OpenAICompatibleProvider(OmniProvider):
     def merge_audio_into_video(self) -> bool:
         return False
 
-    def request_kwargs(self, payload: dict, fps: int) -> dict[str, Any]:
-        """OpenAI 兼容: 标准 chat completion body,model + messages + max_tokens。
+    def request_kwargs(
+        self,
+        payload: dict,
+        fps: int,
+        *,
+        user_max_tokens: int = 1024,
+    ) -> dict[str, Any]:
+        """OpenAI 兼容: 仅设置 max_tokens(继承 user 配置)。
 
-        与 provider 接口无关的 envelope(model/stream/thinking)由所有
-        provider 共享实现。这里只返回 body dict,caller 负责合并其他字段。
+        - streaming / thinking 这类 provider-specific 字段不在这里设
+          (OpenAI 不需要 thinking 字段,MiMo 也是),保持 OpenAICompatibleProvider 的
+          "纯 OpenAI SDK 调用"语义。
+        - max_tokens 继承 user 配置 — 默认 config.max_completion_tokens=512,
+          user 改了(``miloco-cli config set model.omni.max_completion_tokens 2048``)
+          也照用。
+        - 未来 thinking 类 provider(如 MiniMax)override 这里,加 budget_tokens 字段。
         """
-        # 注意:_build_messages 已经构造好了 messages 列表。
-        # 真实使用时,caller 会把 request_kwargs() 提供的 body 字段
-        # 跟 _build_messages() 输出的 messages 合并。
-        # 这个方法留给 provider 扩展 envelope 字段(如 thinking / tools)。
-        return {}
+        return {"max_tokens": user_max_tokens}
 
     def matches_url(self, base_url: str) -> bool:
         """OpenAI 兼容 provider 是默认兜底,匹配任何 URL。

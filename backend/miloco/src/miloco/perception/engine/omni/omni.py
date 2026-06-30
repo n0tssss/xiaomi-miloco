@@ -266,15 +266,29 @@ async def _call_omni_messages(
     if not api_key:
         raise ValueError("MILOCO_MODEL__OMNI__API_KEY is not set; cannot call fused omni")
 
+    # envelope 字段(thinking / max_tokens / stream 等)由 provider 完全控制
+    # —— 调用方不预设(同 omni_client.py 注释)。
+    # fused 模式绕开 _build_messages(调用方自带 messages),但 envelope 走
+    # 同一份 provider 抽象,保证未来 MiniMaxProvider 这种 thinking-on 模型在
+    # 所有 call path 都能 override max_tokens。
+    provider = get_provider(
+        config.base_url, declared=getattr(config, "declared_provider", None)
+    )
+
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
-        "max_tokens": config.max_completion_tokens,
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": False,
-        # thinking 类 envelope 字段统一交给 provider.request_kwargs() 决定,见 omni_client.py 同段注释
     }
+    body.update(
+        provider.request_kwargs(
+            {"messages": messages},
+            fps=3,
+            user_max_tokens=config.max_completion_tokens,
+        )
+    )
 
     client = _get_fused_http_client(config.timeout)
     t0 = time.monotonic()
