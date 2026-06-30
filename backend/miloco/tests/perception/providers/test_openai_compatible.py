@@ -91,25 +91,25 @@ def test_merge_audio_into_video_false():
 
 
 def test_request_kwargs_returns_user_max_tokens():
-    """OpenAI 兼容 provider 唯一 envelope override 就是 max_tokens
-    (继承 user 配置)。
+    """OpenAI 兼容 provider 只设 max_tokens(=provider 原样继承 user 配置)。
 
-    这里只返 max_tokens,未来 thinking 类 provider 会加自己的字段(如
-    ``thinking`` 块)也在这个 return 里 —— caller 不预设 envelope,所有
-    envelope 字段由 provider 完全控制(PR3 契约)。
+    Provider 永远不 override max_tokens;max_tokens 是 user 的设置。Provider
+    只在该 provider 真正需要的 model-specific envelope 字段(如 thinking /
+    stream_options / tools)上返 dict。
     """
     p = OpenAICompatibleProvider()
 
     # 不传 user_max_tokens → 用默认 1024
     assert p.request_kwargs({"foo": "bar"}, fps=3) == {"max_tokens": 1024}
 
-    # 传 user_max_tokens → 原样照用
+    # 传 user_max_tokens → 原样照用(不干预)
     assert p.request_kwargs({}, fps=3, user_max_tokens=512) == {"max_tokens": 512}
     assert p.request_kwargs({}, fps=3, user_max_tokens=4096) == {"max_tokens": 4096}
 
-    # thinking 类 provider 未来可以 override(本测试只覆盖 OpenAI 兼容 path)
-    # MiniMax-M3: provider 会返 {"max_tokens": 4096, "thinking": {...}},
-    # 测试在 test_build_messages_wire_format.py 不再这个文件覆盖
+    # thinking 类 provider 未来应当:继承 user_max_tokens + 自己加 thinking 字段
+    # (本测试只覆盖 OpenAI 兼容 path,MiniMax provider 行为在 PR2 自己的 test 里测)
+    # 反例(不该是这样): {"max_tokens": 4096, "thinking": {...}}
+    #  — provider 不该替用户 cap max_tokens
 
 
 def test_matches_url_always_true():

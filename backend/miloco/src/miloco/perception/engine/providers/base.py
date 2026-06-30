@@ -99,9 +99,15 @@ class OmniProvider(ABC):
         caller 不预设,见 omni_client.py ``body.update(provider.request_kwargs(...))`` 注释。
 
         ``user_max_tokens`` 是 user 在 ``model.omni.max_completion_tokens`` 配置的值,
-        provider 可继承(原值照用)或 override(改大改小)。例如:
+        provider **原样继承**(user 设多少就用多少,provider 不替用户画上限)。
+        例如:
         - OpenAI/MiMo: 继承 ``user_max_tokens``
-        - MiniMax-M3 (thinking-on): 自行加 budget_tokens 字段,override max_tokens 至少 4096
+        - MiniMax-M3 (thinking-on): 同样继承 ``user_max_tokens`` + **自己加** ``thinking``
+          块(thinking 是 MiniMax 需要的 model-specific envelope,不属于 max_tokens 范畴)
+
+        ⚠ provider **永远不 override max_tokens**(那是 user 的设置)。provider
+           只在该 provider 真正需要的 model-specific envelope 字段(如 thinking /
+           stream_options / tools)上返 dict。
 
         返回 {} 表示没有额外参数,caller 沿用 body 默认 envelope。
         """
