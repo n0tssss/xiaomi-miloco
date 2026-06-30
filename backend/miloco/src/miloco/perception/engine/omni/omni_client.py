@@ -158,20 +158,17 @@ async def call_omni(
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
+        "max_tokens": config.max_completion_tokens,  # user config 直接走
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": False,
-        # envelope 字段(thinking / max_tokens / stream 等)全部由
-        # provider.request_kwargs() 决定(PR3 设计)—— caller 不预设任何 envelope,
-        # 只留 model / messages / temperature / top_p 这种语义中性字段。
-        # max_tokens 走 provider,provider 继承 user 配置或 override(thinking 模型)。
+        # caller 设好标准 envelope(上述字段 user config 范畴)。
+        # body.update(provider.request_kwargs(...)) 走的是"额外"字段加法 —
+        # provider 只加模型特定字段(如 MiniMax 的 thinking 块),不替 user 改
+        # max_tokens / temperature / top_p / stream。
     }
     body.update(
-        provider.request_kwargs(
-            payload,
-            fps=payload.get("video_fps", 3),
-            user_max_tokens=config.max_completion_tokens,
-        )
+        provider.request_kwargs(payload, fps=payload.get("video_fps", 3))
     )
 
     t0 = time.monotonic()
@@ -351,19 +348,17 @@ async def call_omni_stream(
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
+        "max_tokens": config.max_completion_tokens,  # user config 直接走
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": True,
         "stream_options": {"include_usage": True},
-        # envelope 字段(thinking / max_tokens / stream 等)全部由
-        # provider.request_kwargs() 决定(同上,见 omni_client.py:158 注释)
+        # caller 设好标准 envelope(streaming 路径多 stream_options,这是 OpenAI
+        # 协议的 streaming metadata,不属于 provider 自行加的范畴)。
+        # provider 仍按 body.update(request_kwargs(...)) 走,只加 extras。
     }
     body.update(
-        provider.request_kwargs(
-            payload,
-            fps=payload.get("video_fps", 3),
-            user_max_tokens=config.max_completion_tokens,
-        )
+        provider.request_kwargs(payload, fps=payload.get("video_fps", 3))
     )
     headers = {
         "Content-Type": "application/json",
