@@ -273,7 +273,7 @@ async def _call_omni_messages(
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": False,
-        "thinking": {"type": "disabled"},
+        # thinking 类 envelope 字段统一交给 provider.request_kwargs() 决定,见 omni_client.py 同段注释
     }
 
     client = _get_fused_http_client(config.timeout)
