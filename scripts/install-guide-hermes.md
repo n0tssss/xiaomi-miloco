@@ -19,7 +19,8 @@ metadata:
 ## Step 1：装插件（agent 自跑）
 
 ```bash
-git clone https://github.com/n0tssss/xiaomi-miloco.git
+# integration 集成测试版（pr-hermes + feat/web-perception-toggles + feat/web-provider-abstraction 三个 PR 合并）
+git clone -b integration https://github.com/n0tssss/xiaomi-miloco.git
 cd xiaomi-miloco
 bash plugins/hermes/install-hermes.sh
 ```
