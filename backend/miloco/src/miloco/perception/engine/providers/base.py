@@ -84,32 +84,24 @@ class OmniProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def request_kwargs(
-        self,
-        payload: dict,
-        fps: int,
-        *,
-        user_max_tokens: int = 1024,
-    ) -> dict:
-        """返回 HTTP request 级别的额外参数(model / stream / thinking / max_tokens 等)。
+    def request_kwargs(self, payload: dict, fps: int) -> dict:
+        """返回 provider 在 caller 标准 envelope 之上**额外需要**的字段。
 
-        不同 provider 在 wire format 之外的 request envelope 也可能不同,
-        例如某些 provider 不支持 stream,某些需要特殊的 thinking 字段等。
-        **envelope 字段(thinking / max_tokens / stream)由 provider 完全控制**——
-        caller 不预设,见 omni_client.py ``body.update(provider.request_kwargs(...))`` 注释。
+        标准 envelope (model / messages / max_tokens / temperature / top_p /
+        stream) 由 caller 直接 set,user config 决定。Provider **不**替 user
+        画 cap,只在该 provider 真正需要的 model-specific 字段上返 dict。
 
-        ``user_max_tokens`` 是 user 在 ``model.omni.max_completion_tokens`` 配置的值,
-        provider **原样继承**(user 设多少就用多少,provider 不替用户画上限)。
-        例如:
-        - OpenAI/MiMo: 继承 ``user_max_tokens``
-        - MiniMax-M3 (thinking-on): 同样继承 ``user_max_tokens`` + **自己加** ``thinking``
-          块(thinking 是 MiniMax 需要的 model-specific envelope,不属于 max_tokens 范畴)
+        典型用法:
+        - OpenAI/MiMo: 返 {} (无额外字段,标准 envelope 够用)
+        - MiniMax-M3 (thinking-on): 返 ``{"thinking": {"type": "enabled",
+          "budget_tokens": 1024}}`` 之类
+        - 一些 provider 返 ``{"stream_options": {...}}`` 之类微调
 
-        ⚠ provider **永远不 override max_tokens**(那是 user 的设置)。provider
-           只在该 provider 真正需要的 model-specific envelope 字段(如 thinking /
-           stream_options / tools)上返 dict。
+        audio/video mux 等 wire-format 行为由 ``video_block()`` /
+        ``audio_block()`` / ``merge_audio_into_video()`` 各自定义 ——
+        request_kwargs 跟 wire format 无关,只管 envelope-level extras。
 
-        返回 {} 表示没有额外参数,caller 沿用 body 默认 envelope。
+        返回 {} 表示无额外字段,caller 的 body 不动。
         """
         raise NotImplementedError
 
