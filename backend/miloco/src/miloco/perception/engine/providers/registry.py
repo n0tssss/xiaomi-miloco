@@ -23,6 +23,7 @@ from functools import lru_cache
 from typing import Type
 
 from miloco.perception.engine.providers.base import OmniProvider
+from miloco.perception.engine.providers.minimax import MiniMaxProvider
 from miloco.perception.engine.providers.openai_compatible import (
     OpenAICompatibleProvider,
 )
@@ -127,10 +128,9 @@ def get_provider(
 
 # === 默认注册 ===
 # 注意顺序: 越专用的 provider 越靠前(优先匹配),OpenAI 兼容放最后(兜底)
-# 当前只有 OpenAI 兼容;PR2 会加 MiniMax,放在 OpenAI 前面。
+# 当前只有 OpenAI 兼容;MiniMax 已实装(PR2 完成),放在 OpenAI 前面。
+register_provider("minimax", MiniMaxProvider)
 register_provider("openai", OpenAICompatibleProvider)
-# PR2 加这里:
-# register_provider("minimax", MiniMaxProvider)
-# PR4 加:
+# 后续 PR(可能):Qwen-VL / Gemini 等其他 provider。
 # register_provider("qwen_vl", QwenVLProvider)
 # register_provider("gemini", GeminiProvider)
