@@ -58,25 +58,26 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
   const [testingDid, setTestingDid] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
     did: string; name: string; video: string; audio: string;
+    hasVideoErr?: boolean; hasAudioErr?: boolean;
   } | null>(null);
 
   const sorted = useMemo(() => sortCamerasByDid(cameras), [cameras]);
 
-  /** "测试"按钮:发 video+audio 两条 perceive query,结果显示在弹框 */
+  /** 测试:顺序发 video+audio perceive query,错误/空都显示在弹框 */
   const runTest = async (c: ScopeCamera) => {
     if (testingDid) return;
     setTestingDid(c.did);
-    try {
-      const [video, audio] = await Promise.all([
-        perceiveQuery([c.did], "画面里有什么？简要描述。"),
-        perceiveQuery([c.did], "这段音频里有什么声音？简要描述。"),
-      ]);
-      setTestResult({ did: c.did, name: c.name, video, audio });
-    } catch (e) {
-      toast(e instanceof Error ? e.message : "测试失败", "warn");
-    } finally {
-      setTestingDid(null);
-    }
+    setTestResult(null);
+    let video = ""; let audio = "";
+    let videoErr = ""; let audioErr = "";
+    try { video = await perceiveQuery([c.did], "画面里有什么。"); }
+    catch (e) { videoErr = e instanceof Error ? e.message : String(e); }
+    try { audio = await perceiveQuery([c.did], "有什么声音。"); }
+    catch (e) { audioErr = e instanceof Error ? e.message : String(e); }
+    setTestResult({ did: c.did, name: c.name,
+      video: videoErr || video, audio: audioErr || audio,
+      hasVideoErr: !!videoErr, hasAudioErr: !!audioErr });
+    setTestingDid(null);
   };
   const online = useMemo(() => onlineCamerasFn(cameras), [cameras]);
 
@@ -322,14 +323,23 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
               <button onClick={() => setTestResult(null)} className="text-text-tertiary hover:text-text-primary">✕</button>
             </div>
             <div className="space-y-3 text-body">
-              <div>
-                <span className="text-caption text-text-tertiary">视频</span>
-                <p className="text-text-secondary mt-1">{testResult.video}</p>
-              </div>
-              <div>
-                <span className="text-caption text-text-tertiary">音频</span>
-                <p className="text-text-secondary mt-1">{testResult.audio}</p>
-              </div>
+              {(["视频","音频"] as const).map((label) => {
+                const key = label === "视频" ? "video" : "audio";
+                const errKey = label === "视频" ? "hasVideoErr" : "hasAudioErr";
+                const txt = testResult[key as "video"|"audio"];
+                const isErr = testResult[errKey];
+                const isEmpty = !txt && !isErr;
+                return (
+                  <div key={label}>
+                    <span className={`text-caption ${isErr ? "text-danger" : "text-text-tertiary"}`}>
+                      {label}{isErr ? " (失败)" : ""}
+                    </span>
+                    <p className={`mt-1 ${isErr ? "text-danger" : isEmpty ? "text-text-tertiary" : "text-text-secondary"}`}>
+                      {txt || (isErr ? "请求失败" : "空 — 摄像头可能未在实时感知")}
+                    </p>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
