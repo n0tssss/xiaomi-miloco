@@ -938,9 +938,9 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     isOnline: c.is_online,
     inUse: c.in_use,
     connected: c.connected,
-    // v2 新增
-    videoEnabled: c.video_enabled,
-    audioEnabled: c.audio_enabled,
+    // v2 新增 — v1 backend 不返,用 in_use 兜底
+    videoEnabled: c.video_enabled ?? c.in_use ?? true,
+    audioEnabled: c.audio_enabled ?? c.in_use ?? true,
   }));
 }
 

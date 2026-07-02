@@ -63,12 +63,21 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
     next: boolean,
   ) => {
     if (bulkBusy || singleBusy.has(did)) return;
+    const cam = sorted.find((c) => c.did === did);
+    if (!cam) return;
+    // v1 back-compat: in_use 必填,需据 current + next 推
+    const otherEnabled =
+      modality === "video" ? cam.audioEnabled : cam.videoEnabled;
+    const newInUse = next || otherEnabled;
     setSingleBusy((s) => new Set(s).add(did));
     try {
-      const item: CameraToggleItem =
-        modality === "video"
-          ? { did, videoEnabled: next }
-          : { did, audioEnabled: next };
+      const item: CameraToggleItem = {
+        did,
+        inUse: newInUse,
+        ...(modality === "video"
+          ? { videoEnabled: next }
+          : { audioEnabled: next }),
+      };
       await toggleScopeCamera([item]);
       onChanged();
     } catch (e) {
@@ -86,13 +95,10 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
   const runMaster = async (c: ScopeCamera) => {
     if (bulkBusy || singleBusy.has(c.did) || rowToggleDisabled(c)) return;
     const nextEnabled = !(c.videoEnabled || c.audioEnabled);
-    // "next" 已经被推上:off → next=true (全开);on/mid → next=false (全关)
-    // 注:与单纯视频/音频切换不同,主开关不动 inUse(整体入网状态),只动模态位
-    //    ——因为 disable 整相机感知等价于 inUse=false 但语义更细。
     setSingleBusy((s) => new Set(s).add(c.did));
     try {
       await toggleScopeCamera([
-        { did: c.did, videoEnabled: nextEnabled, audioEnabled: nextEnabled },
+        { did: c.did, videoEnabled: nextEnabled, audioEnabled: nextEnabled, inUse: nextEnabled },
       ]);
       onChanged();
     } catch (e) {
@@ -112,11 +118,12 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
     try {
       const items: CameraToggleItem[] = online.map((c) => {
         if (kind === "master") {
-          return { did: c.did, videoEnabled: next, audioEnabled: next };
+          return { did: c.did, videoEnabled: next, audioEnabled: next, inUse: next };
         }
+        // v1 back-compat: in_use 必填,据 current + next 推
         return kind === "video"
-          ? { did: c.did, videoEnabled: next }
-          : { did: c.did, audioEnabled: next };
+          ? { did: c.did, videoEnabled: next, inUse: next || c.audioEnabled }
+          : { did: c.did, audioEnabled: next, inUse: c.videoEnabled || next };
       });
       await toggleScopeCamera(items);
       onChanged();
