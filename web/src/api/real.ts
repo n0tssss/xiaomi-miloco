@@ -938,9 +938,9 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     isOnline: c.is_online,
     inUse: c.in_use,
     connected: c.connected,
-    // v2 新增
-    videoEnabled: c.video_enabled,
-    audioEnabled: c.audio_enabled,
+    // v2 新增 — v1 backend 不返,用 in_use 兜底
+    videoEnabled: c.video_enabled ?? c.in_use ?? true,
+    audioEnabled: c.audio_enabled ?? c.in_use ?? true,
   }));
 }
 
@@ -1529,4 +1529,20 @@ export async function realDeleteTask(taskId: string): Promise<void> {
     `/api/tasks/${encodeURIComponent(taskId)}?reason=abandoned`,
     { method: "DELETE" },
   );
+}
+
+// ── 感知测试 ──────────────────────────────────────────────
+interface PerceiveResult {
+  answer: string;
+}
+
+export async function realPerceiveQuery(
+  sources: string[],
+  query: string,
+): Promise<string> {
+  const r = await apiFetch<Normal<PerceiveResult>>("/api/perception/perceive", {
+    method: "POST",
+    body: JSON.stringify({ sources, query }),
+  });
+  return r.data.answer;
 }

@@ -66,19 +66,13 @@ export function HeroNow({
     () => new Map(cameras.map((c) => [c.did, c.channel])),
     [cameras],
   );
-  // 上区 = miloco **当前真正在投喂视频** 的相机。判据用后端权威字段 `connected`
-  // (= MiotService._connected_camera_dids() = 感知 camera_adapter.get_connected_devices()，
-  // 即真正建连、在喂解码帧给感知的那几路)，而不是 `inUse`(只是 KV 里的"想启用"意图——
-  // 启用了但 LAN 拉不起来时 inUse=true 却没真投喂)。再 **按 did 稳定排序**:toggle 某路时
-  // 其余卡 key+DOM 位置不变，React 复用其 iframe，不会连带把其它路的 watch 流断开重连。
-  // 其余相机(未投喂:未启用 / 启用中未连上 / 超出上限)进下区「无流」横向列表。
+  // 上区 = 任一模态开启(inUse=true)即显示实时预览,方便用户持续查看监控画面。
+  // 关闭单独视频/音频不影响预览(只影响模型接收的感知数据)。
+  // 按 did 稳定排序:toggle 某路时其余卡 key+DOM 位置不变,React 复用 iframe。
   const streamingCams = useMemo(() => {
     const byDid = (a: ScopeCamera, b: ScopeCamera) =>
       a.did < b.did ? -1 : a.did > b.did ? 1 : 0;
-    const sorted = [...scopeCameras].sort(byDid);
-    // 不再前端截断:connected 集天然受后端 MAX_ENABLED_CAMERAS 约束(感知接入层按 did
-    // 升序截断到上限、只连前 N 路；主动 enable 超限也被 toggle_camera 挡下)，展示集即真实投喂集。
-    return sorted.filter((c) => c.connected);
+    return [...scopeCameras].filter((c) => c.inUse).sort(byDid);
   }, [scopeCameras]);
   // 今日 token 用量小入口（omni 计费）
   const todayUsage = useAsync<UsageStats>(

@@ -510,3 +510,11 @@ export async function getMemorySeries(
     `/api/monitor/memory/series?window=${w}&bucket=${bucket}`,
   );
 }
+
+// ── 感知测试 ──────────────────────────────────────────────
+export async function perceiveQuery(
+  sources: string[],
+  query: string,
+): Promise<string> {
+  return realImpl.realPerceiveQuery(sources, query);
+}

@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 import type { ScopeCamera } from "@/lib/types";
 import {
   toggleScopeCamera,
+  perceiveQuery,
   type CameraToggleItem,
 } from "@/api";
 import { toast } from "./Toast";
@@ -53,8 +54,31 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
   const { t } = useTranslation();
   const [singleBusy, setSingleBusy] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  // 测试按钮状态
+  const [testingDid, setTestingDid] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<{
+    did: string; name: string; video: string; audio: string;
+    hasVideoErr?: boolean; hasAudioErr?: boolean;
+  } | null>(null);
 
   const sorted = useMemo(() => sortCamerasByDid(cameras), [cameras]);
+
+  /** 测试:顺序发 video+audio perceive query,错误/空都显示在弹框 */
+  const runTest = async (c: ScopeCamera) => {
+    if (testingDid) return;
+    setTestingDid(c.did);
+    setTestResult(null);
+    let video = ""; let audio = "";
+    let videoErr = ""; let audioErr = "";
+    try { video = await perceiveQuery([c.did], "画面里有什么。"); }
+    catch (e) { videoErr = e instanceof Error ? e.message : String(e); }
+    try { audio = await perceiveQuery([c.did], "有什么声音。"); }
+    catch (e) { audioErr = e instanceof Error ? e.message : String(e); }
+    setTestResult({ did: c.did, name: c.name,
+      video: videoErr || video, audio: audioErr || audio,
+      hasVideoErr: !!videoErr, hasAudioErr: !!audioErr });
+    setTestingDid(null);
+  };
   const online = useMemo(() => onlineCamerasFn(cameras), [cameras]);
 
   const runSingle = async (
@@ -63,12 +87,21 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
     next: boolean,
   ) => {
     if (bulkBusy || singleBusy.has(did)) return;
+    const cam = sorted.find((c) => c.did === did);
+    if (!cam) return;
+    // v1 back-compat: in_use 必填,需据 current + next 推
+    const otherEnabled =
+      modality === "video" ? cam.audioEnabled : cam.videoEnabled;
+    const newInUse = next || otherEnabled;
     setSingleBusy((s) => new Set(s).add(did));
     try {
-      const item: CameraToggleItem =
-        modality === "video"
-          ? { did, videoEnabled: next }
-          : { did, audioEnabled: next };
+      const item: CameraToggleItem = {
+        did,
+        inUse: newInUse,
+        ...(modality === "video"
+          ? { videoEnabled: next }
+          : { audioEnabled: next }),
+      };
       await toggleScopeCamera([item]);
       onChanged();
     } catch (e) {
@@ -86,13 +119,10 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
   const runMaster = async (c: ScopeCamera) => {
     if (bulkBusy || singleBusy.has(c.did) || rowToggleDisabled(c)) return;
     const nextEnabled = !(c.videoEnabled || c.audioEnabled);
-    // "next" 已经被推上:off → next=true (全开);on/mid → next=false (全关)
-    // 注:与单纯视频/音频切换不同,主开关不动 inUse(整体入网状态),只动模态位
-    //    ——因为 disable 整相机感知等价于 inUse=false 但语义更细。
     setSingleBusy((s) => new Set(s).add(c.did));
     try {
       await toggleScopeCamera([
-        { did: c.did, videoEnabled: nextEnabled, audioEnabled: nextEnabled },
+        { did: c.did, videoEnabled: nextEnabled, audioEnabled: nextEnabled, inUse: nextEnabled },
       ]);
       onChanged();
     } catch (e) {
@@ -112,11 +142,12 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
     try {
       const items: CameraToggleItem[] = online.map((c) => {
         if (kind === "master") {
-          return { did: c.did, videoEnabled: next, audioEnabled: next };
+          return { did: c.did, videoEnabled: next, audioEnabled: next, inUse: next };
         }
+        // v1 back-compat: in_use 必填,据 current + next 推
         return kind === "video"
-          ? { did: c.did, videoEnabled: next }
-          : { did: c.did, audioEnabled: next };
+          ? { did: c.did, videoEnabled: next, inUse: next || c.audioEnabled }
+          : { did: c.did, audioEnabled: next, inUse: c.videoEnabled || next };
       });
       await toggleScopeCamera(items);
       onChanged();
@@ -232,47 +263,47 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
                       )}
                     </td>
 
-                    {/* 视频感知 状态列 */}
+                    {/* 视频感知:开关直接在此列 */}
                     <td className="px-3 py-3 text-center hidden sm:table-cell">
-                      <StateBadge
-                        kind="video"
-                        enabled={c.videoEnabled}
-                        offline={offline}
+                      <ModalitySwitch
+                        checked={c.videoEnabled}
+                        disabled={offline || busy}
+                        onChange={(next) => runSingle(c.did, "video", next)}
+                        ariaLabel={`${c.name} · ${t("hero.table.headerVideo")}`}
                       />
                     </td>
 
-                    {/* 音频感知 状态列 */}
+                    {/* 音频感知:开关直接在此列 */}
                     <td className="px-3 py-3 text-center">
-                      <StateBadge
-                        kind="audio"
-                        enabled={c.audioEnabled}
-                        offline={offline}
+                      <ModalitySwitch
+                        checked={c.audioEnabled}
+                        disabled={offline || busy}
+                        onChange={(next) => runSingle(c.did, "audio", next)}
+                        ariaLabel={`${c.name} · ${t("hero.table.headerAudio")}`}
                       />
                     </td>
 
-                    {/* 操作列:3 个 toggle */}
-                    <td className="px-5 py-3">
-                      <div className="flex items-center justify-end gap-3 flex-wrap">
-                        <ModalitySwitch
-                          checked={c.videoEnabled}
-                          disabled={offline || busy}
-                          onChange={(next) => runSingle(c.did, "video", next)}
-                          ariaLabel={`${c.name} · ${t("hero.table.headerVideo")}`}
-                          modality="video"
-                        />
-                        <ModalitySwitch
-                          checked={c.audioEnabled}
-                          disabled={offline || busy}
-                          onChange={(next) => runSingle(c.did, "audio", next)}
-                          ariaLabel={`${c.name} · ${t("hero.table.headerAudio")}`}
-                          modality="audio"
-                        />
+                    {/* 操作列:整设备主开关 + 测试 */}
+                    <td className="px-5 py-3 text-right">
+                      <div className="flex items-center justify-end gap-2">
                         <MasterSwitch
                           state={master}
                           disabled={offline || busy}
                           onClick={() => runMaster(c)}
                           ariaLabel={`${c.name} · ${t("hero.table.headerMaster")}`}
                         />
+                        <button
+                          type="button"
+                          disabled={offline || testingDid === c.did}
+                          onClick={() => runTest(c)}
+                          className="text-caption px-2 py-1 rounded bg-bg-primary border border-border hover:border-border-strong disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {testingDid === c.did ? (
+                            <span className="inline-block h-3 w-3 border-2 border-text-tertiary border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            t("hero.table.testBtn")
+                          )}
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -280,6 +311,37 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* 测试结果弹框 */}
+      {testResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setTestResult(null)}>
+          <div className="bg-bg-primary rounded-xl border border-border shadow-lg p-5 max-w-sm w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-title text-text-primary">{testResult.name} · 感知测试</span>
+              <button onClick={() => setTestResult(null)} className="text-text-tertiary hover:text-text-primary">✕</button>
+            </div>
+            <div className="space-y-3 text-body">
+              {(["视频","音频"] as const).map((label) => {
+                const key = label === "视频" ? "video" : "audio";
+                const errKey = label === "视频" ? "hasVideoErr" : "hasAudioErr";
+                const txt = testResult[key as "video"|"audio"];
+                const isErr = testResult[errKey];
+                const isEmpty = !txt && !isErr;
+                return (
+                  <div key={label}>
+                    <span className={`text-caption ${isErr ? "text-danger" : "text-text-tertiary"}`}>
+                      {label}{isErr ? " (失败)" : ""}
+                    </span>
+                    <p className={`mt-1 ${isErr ? "text-danger" : isEmpty ? "text-text-tertiary" : "text-text-secondary"}`}>
+                      {txt || (isErr ? "请求失败" : "空 — 摄像头可能未在实时感知")}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
     </section>
@@ -309,40 +371,6 @@ function BulkButton({
   );
 }
 
-/** 状态徽章:● ON / ○ OFF / ─ 离线 / ◐ mid（主开关专用）。 */
-function StateBadge({
-  kind,
-  enabled,
-  offline,
-}: {
-  kind: "video" | "audio";
-  enabled: boolean;
-  offline: boolean;
-}) {
-  if (offline) {
-    return (
-      <span className="text-caption text-text-tertiary" aria-label="unavailable">
-        —
-      </span>
-    );
-  }
-  return (
-    <span
-      className={`inline-flex items-center gap-1.5 text-caption ${
-        enabled ? "text-brand-primary" : "text-text-tertiary"
-      }`}
-      aria-label={kind === "video" ? "video" : "audio"}
-    >
-      <span
-        className={`inline-block h-2 w-2 rounded-full ${
-          enabled ? "bg-brand-primary" : "bg-text-tertiary"
-        }`}
-      />
-      {enabled ? "ON" : "OFF"}
-    </span>
-  );
-}
-
 function ModalitySwitch({
   checked,
   disabled,
@@ -353,7 +381,6 @@ function ModalitySwitch({
   disabled: boolean;
   onChange: (next: boolean) => void;
   ariaLabel: string;
-  modality: Modality;
 }) {
   const { t } = useTranslation();
   const labelText = checked ? t("hero.table.on") : t("hero.table.off");
