@@ -53,6 +53,7 @@
       "bulkAudioAllOff": "全部关闭音频",
       "bulkMasterAllOn": "全部启用感知",
       "bulkMasterAllOff": "全部暂停感知",
+      "testBtn": "测试",
       "offlineHint": "已离线",
       "empty": "米家账号下还没有摄像头"
     }

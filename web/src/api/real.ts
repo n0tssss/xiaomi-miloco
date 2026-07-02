@@ -1530,3 +1530,19 @@ export async function realDeleteTask(taskId: string): Promise<void> {
     { method: "DELETE" },
   );
 }
+
+// ── 感知测试 ──────────────────────────────────────────────
+interface PerceiveResult {
+  answer: string;
+}
+
+export async function realPerceiveQuery(
+  sources: string[],
+  query: string,
+): Promise<string> {
+  const r = await apiFetch<Normal<PerceiveResult>>("/api/perception/perceive", {
+    method: "POST",
+    body: JSON.stringify({ sources, query }),
+  });
+  return r.data.answer;
+}

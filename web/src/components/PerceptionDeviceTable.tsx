@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 import type { ScopeCamera } from "@/lib/types";
 import {
   toggleScopeCamera,
+  perceiveQuery,
   type CameraToggleItem,
 } from "@/api";
 import { toast } from "./Toast";
@@ -53,8 +54,30 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
   const { t } = useTranslation();
   const [singleBusy, setSingleBusy] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  // 测试按钮状态
+  const [testingDid, setTestingDid] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<{
+    did: string; name: string; video: string; audio: string;
+  } | null>(null);
 
   const sorted = useMemo(() => sortCamerasByDid(cameras), [cameras]);
+
+  /** "测试"按钮:发 video+audio 两条 perceive query,结果显示在弹框 */
+  const runTest = async (c: ScopeCamera) => {
+    if (testingDid) return;
+    setTestingDid(c.did);
+    try {
+      const [video, audio] = await Promise.all([
+        perceiveQuery([c.did], "画面里有什么？简要描述。"),
+        perceiveQuery([c.did], "这段音频里有什么声音？简要描述。"),
+      ]);
+      setTestResult({ did: c.did, name: c.name, video, audio });
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "测试失败", "warn");
+    } finally {
+      setTestingDid(null);
+    }
+  };
   const online = useMemo(() => onlineCamerasFn(cameras), [cameras]);
 
   const runSingle = async (
@@ -259,20 +282,56 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
                       />
                     </td>
 
-                    {/* 操作列:整设备主开关 */}
+                    {/* 操作列:整设备主开关 + 测试 */}
                     <td className="px-5 py-3 text-right">
-                      <MasterSwitch
-                        state={master}
-                        disabled={offline || busy}
-                        onClick={() => runMaster(c)}
-                        ariaLabel={`${c.name} · ${t("hero.table.headerMaster")}`}
-                      />
+                      <div className="flex items-center justify-end gap-2">
+                        <MasterSwitch
+                          state={master}
+                          disabled={offline || busy}
+                          onClick={() => runMaster(c)}
+                          ariaLabel={`${c.name} · ${t("hero.table.headerMaster")}`}
+                        />
+                        <button
+                          type="button"
+                          disabled={offline || testingDid === c.did}
+                          onClick={() => runTest(c)}
+                          className="text-caption px-2 py-1 rounded bg-bg-primary border border-border hover:border-border-strong disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {testingDid === c.did ? (
+                            <span className="inline-block h-3 w-3 border-2 border-text-tertiary border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            t("hero.table.testBtn")
+                          )}
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* 测试结果弹框 */}
+      {testResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setTestResult(null)}>
+          <div className="bg-bg-primary rounded-xl border border-border shadow-lg p-5 max-w-sm w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-title text-text-primary">{testResult.name} · 感知测试</span>
+              <button onClick={() => setTestResult(null)} className="text-text-tertiary hover:text-text-primary">✕</button>
+            </div>
+            <div className="space-y-3 text-body">
+              <div>
+                <span className="text-caption text-text-tertiary">视频</span>
+                <p className="text-text-secondary mt-1">{testResult.video}</p>
+              </div>
+              <div>
+                <span className="text-caption text-text-tertiary">音频</span>
+                <p className="text-text-secondary mt-1">{testResult.audio}</p>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </section>

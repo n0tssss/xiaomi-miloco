@@ -53,6 +53,7 @@
       "bulkAudioAllOff": "Disable all audio",
       "bulkMasterAllOn": "Enable perception on all",
       "bulkMasterAllOff": "Pause perception on all",
+      "testBtn": "Test",
       "offlineHint": "Offline",
       "empty": "No cameras on this Xiaomi Home account yet"
     }
