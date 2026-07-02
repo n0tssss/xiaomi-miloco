@@ -239,48 +239,34 @@ export function PerceptionDeviceTable({ cameras, onChanged }: Props) {
                       )}
                     </td>
 
-                    {/* 视频感知 状态列 */}
+                    {/* 视频感知:开关直接在此列 */}
                     <td className="px-3 py-3 text-center hidden sm:table-cell">
-                      <StateBadge
-                        kind="video"
-                        enabled={c.videoEnabled}
-                        offline={offline}
+                      <ModalitySwitch
+                        checked={c.videoEnabled}
+                        disabled={offline || busy}
+                        onChange={(next) => runSingle(c.did, "video", next)}
+                        ariaLabel={`${c.name} · ${t("hero.table.headerVideo")}`}
                       />
                     </td>
 
-                    {/* 音频感知 状态列 */}
+                    {/* 音频感知:开关直接在此列 */}
                     <td className="px-3 py-3 text-center">
-                      <StateBadge
-                        kind="audio"
-                        enabled={c.audioEnabled}
-                        offline={offline}
+                      <ModalitySwitch
+                        checked={c.audioEnabled}
+                        disabled={offline || busy}
+                        onChange={(next) => runSingle(c.did, "audio", next)}
+                        ariaLabel={`${c.name} · ${t("hero.table.headerAudio")}`}
                       />
                     </td>
 
-                    {/* 操作列:3 个 toggle */}
-                    <td className="px-5 py-3">
-                      <div className="flex items-center justify-end gap-3 flex-wrap">
-                        <ModalitySwitch
-                          checked={c.videoEnabled}
-                          disabled={offline || busy}
-                          onChange={(next) => runSingle(c.did, "video", next)}
-                          ariaLabel={`${c.name} · ${t("hero.table.headerVideo")}`}
-                          modality="video"
-                        />
-                        <ModalitySwitch
-                          checked={c.audioEnabled}
-                          disabled={offline || busy}
-                          onChange={(next) => runSingle(c.did, "audio", next)}
-                          ariaLabel={`${c.name} · ${t("hero.table.headerAudio")}`}
-                          modality="audio"
-                        />
-                        <MasterSwitch
-                          state={master}
-                          disabled={offline || busy}
-                          onClick={() => runMaster(c)}
-                          ariaLabel={`${c.name} · ${t("hero.table.headerMaster")}`}
-                        />
-                      </div>
+                    {/* 操作列:整设备主开关 */}
+                    <td className="px-5 py-3 text-right">
+                      <MasterSwitch
+                        state={master}
+                        disabled={offline || busy}
+                        onClick={() => runMaster(c)}
+                        ariaLabel={`${c.name} · ${t("hero.table.headerMaster")}`}
+                      />
                     </td>
                   </tr>
                 );
@@ -316,40 +302,6 @@ function BulkButton({
   );
 }
 
-/** 状态徽章:● ON / ○ OFF / ─ 离线 / ◐ mid（主开关专用）。 */
-function StateBadge({
-  kind,
-  enabled,
-  offline,
-}: {
-  kind: "video" | "audio";
-  enabled: boolean;
-  offline: boolean;
-}) {
-  if (offline) {
-    return (
-      <span className="text-caption text-text-tertiary" aria-label="unavailable">
-        —
-      </span>
-    );
-  }
-  return (
-    <span
-      className={`inline-flex items-center gap-1.5 text-caption ${
-        enabled ? "text-brand-primary" : "text-text-tertiary"
-      }`}
-      aria-label={kind === "video" ? "video" : "audio"}
-    >
-      <span
-        className={`inline-block h-2 w-2 rounded-full ${
-          enabled ? "bg-brand-primary" : "bg-text-tertiary"
-        }`}
-      />
-      {enabled ? "ON" : "OFF"}
-    </span>
-  );
-}
-
 function ModalitySwitch({
   checked,
   disabled,
@@ -360,7 +312,6 @@ function ModalitySwitch({
   disabled: boolean;
   onChange: (next: boolean) => void;
   ariaLabel: string;
-  modality: Modality;
 }) {
   const { t } = useTranslation();
   const labelText = checked ? t("hero.table.on") : t("hero.table.off");
