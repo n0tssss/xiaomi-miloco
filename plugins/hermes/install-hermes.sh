@@ -642,6 +642,11 @@ except Exception:
         info "  miot/$_f ✓"
       fi
     done
+    # config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
+    if [ -f "$FORK_SRC/config/settings.py" ]; then
+      cp "$FORK_SRC/config/settings.py" "$MILOCO_PKG/config/settings.py"
+      info "  config/settings.py ✓"
+    fi
     # perception/collect/camera_adapter.py
     _src="$FORK_SRC/perception/collect/camera_adapter.py"
     _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
