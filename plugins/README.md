@@ -1,62 +1,97 @@
-# miloco 插件目录
+# plugins/<runtime>/ 规范
 
-每个子目录是一个 **agent runtime 适配**：把 miloco 的 16 个共享 skill（`../skills/miloco-*`）接到对应 agent 上，并提供入站 webhook 适配层（如果该 agent 不能直接注册 HTTP 路由）。
+## 目录布局
 
-## 当前支持的 runtime
+```
+plugins/
+├── openclaw/    # 官方默认 agent runtime(TypeScript + 小米 OpenClaw)
+├── hermes/      # 开源 agent runtime(Python + NousResearch Hermes Agent) 【hermes-pr.md 落地】
+└── <next>/      # 未来 runtime 模板参考此布局
+```
 
-| 子目录 | agent | 语言 | 状态 |
-|---|---|---|---|
-| [`openclaw/`](openclaw/) | [OpenClaw](https://openclaw.ai) | TypeScript | **默认**，跟 miloco 主仓一起发布 |
-| [`hermes/`](hermes/) | [Hermes Agent](https://github.com/NousResearch/hermes-agent)（开源 MIT，Python） | Python | 第二 runtime，本目录新增 |
+每个 runtime 必须:
+- 自包含(plugin / adapter / install 脚本 / tests)
+- 命名 runtime 目录为单数(`hermes/` 不 `hermes-plugin/`)
+- 不动 `backend/` 后端代码、不动 `openclaw/` 已存在的代码
+- 通过 `install-<runtime>.sh` 一键脚本交付
 
-## 给后续第三个 runtime 的最小骨架
-
-加新 runtime 时，按以下结构和命名约定走，便于用户发现、agent 安装脚本抓取、维护者一眼看明白：
+## 子目录标准
 
 ```
 plugins/<runtime>/
-├── README.md                    # 6 段对齐 openclaw：Install / What It Does / Configuration / Development / License
-├── install-<runtime>.sh         # 一键安装（patch miloco config / agent env / 启 adapter，幂等）
-├── <runtime>-plugin/            # 该 agent 侧的插件（出站）
-│   └── （hook / tool / skill 装载逻辑）
-├── adapter/                     # 入站 webhook 适配进程（如 agent 不能注册 HTTP 路由才需要）
-│   └── __main__.py
-├── scripts/
-│   ├── install.sh               # 高级/手动安装
-│   └── <runtime>-adapter.sh     # adapter 生命周期（start/stop/restart/status/logs）
-├── skills/                      # sync-skills.py 生成的产物，gitignore
-└── tests/                       # 至少：pytest 单元 + bash e2e（装+adapter 全生命周期）
+├── README.md                    # 架构图 + 12 项状态 + 与 OpenClaw 差异
+├── install-<runtime>.sh         # 一键脚本(幂等,可重跑)
+├── miloco-plugin/               # 业务逻辑(skills / tools / hooks)
+│   ├── __init__.py
+│   ├── tools_<feature>.py        # 工具实现
+│   ├── context_injection.py      # profile 判定 + 块构造
+│   ├── trace.py                  # trace 钩子
+│   └── cron_setup.py             # 受管 cron reconcile
+├── skills/                      # 由 install 脚本 cp 到 runtime 的 skills 目录
+├── adapter/                     # 【仅 PR #279 老架构需要,主线 #1 后可删】(hermes 已删)
+│                                # 不需要 adapter 进程就走 backend 直调架构
+└── tests/                       # pytest 覆盖
 ```
 
-**agent 安装脚本（给 AI agent 跑）放哪**：
+## `install-<runtime>.sh` 标准
 
-- 放 `scripts/install-guide-<runtime>.md`（与 OpenClaw 的 `scripts/install-guide.md` 同级）
-- 模板见 [scripts/install-guide-hermes.md](../scripts/install-guide-hermes.md)
-- 主 README 方式一里加 `<runtime>` 子段，URL 用 `https://raw.githubusercontent.com/XiaoMi/xiaomi-miloco/main/scripts/install-guide-<runtime>.md`
+1. 前置检查(python/runtime-cli/`<MILOCO_HOME>`/`<MILOCO_HOME>/config.json`)
+2. 同步 16 个 miloco-* skill → `<runtime_home>/skills/`
+3. cp miloco-plugin → `<runtime_home>/plugins/miloco/miloco-plugin/`
+4. 【主线路由】cp `<runtime>_adapter/` → `<MILOCO_HOME>/agent_platform/<runtime>/` + 写 `config.json::agent.platform=<runtime>`
+5. ONNX 模型同步 → `<MILOCO_HOME>/models/`
+6. 写 `<runtime_home>/.env::API_SERVER_KEY`
+7. register plugin
+8. (可选)启动后端 / adapter / 重启 runtime
+9. 记录 versions → plugin state.json
 
-**skill 源复用**：
+## agent platform 抽象(主线 #1 后)
 
-- **不要**在 `<runtime>/skills/` 里维护 skill，所有 skill 源在 [`../skills/miloco-*`](../skills/)
-- 用 `<runtime>/scripts/sync-skills.py` 从共享源生成并适配 frontmatter（删 agent-specific 字段、加 date 引号等）
-- OpenClaw 版做法见 [`openclaw/scripts/`](../openclaw/scripts/)，Hermes 版做法见 [`hermes/scripts/sync-skills.py`](hermes/scripts/sync-skills.py)
+backend 不写平台相关代码,通过 `AgentPlatformAdapter` 抽象:
 
-**PR 提交规范**：
+```python
+# backend/.../agent_platform/base.py
+class AgentPlatformAdapter(ABC):
+    name: str
 
-- 主 README（英+中）方式一加 `<runtime>` 子段
-- `knowledge/03-features/<runtime>-integration.md` 写架构 + 跟 OpenClaw 差异
-- `knowledge/05-external-deps/sdk-<runtime>.md` 写 agent 平台契约
-- `.gitignore` 加 `plugins/<runtime>/skills/`
-- 致谢加该 agent 项目
-- 标题建议：`<runtime> 兼容层（统一 plugins/<runtime>/ 规范）`
+    @abstractmethod
+    async def send_turn(self, ctx: TurnContext) -> AgentTurnResult: ...
 
-## 命名约定
+    @abstractmethod
+    async def read_trace_meta(self, run_id: str) -> TraceMeta | None: ...
 
-| 资源 | 命名 |
-|---|---|
-| 子目录 | `plugins/<runtime>/`（小写 agent 名） |
-| 插件名（agent 侧） | `miloco`（与 OpenClaw 版同名，agent 看到的是同一插件） |
-| 一键安装脚本 | `plugins/<runtime>/install-<runtime>.sh` |
-| Adapter 生命周期脚本 | `plugins/<runtime>/scripts/<runtime>-adapter.sh` |
-| 适配层包名 | `plugins.<runtime>.adapter`（可作为 Python `python -m` 入口） |
-| agent 安装 skill | `scripts/install-guide-<runtime>.md` |
-| 知识库条目 | `knowledge/03-features/<runtime>-integration.md` / `knowledge/05-external-deps/sdk-<runtime>.md` |
+    @abstractmethod
+    def build_system(self, profile: str, extra: dict) -> str: ...
+```
+
+**Plugin 侧实现**:`plugins/<runtime>/<runtime>_adapter/adapter.py`
+- duck-typed(5 方法契约,不强制继承)
+- 由 `install-<runtime>.sh` Step 4.x cp 到 `<MILOCO_HOME>/agent_platform/<runtime>/`
+- backend `agent_platform/loader.py` 动态 import
+
+## 与 OpenClaw 的关键差异参考
+
+| 维度 | OpenClaw | Hermes |
+|---|---|---|
+| 语言 | TypeScript | Python |
+| 上下文注入通道 | `before_prompt_build` → system prompt | `AgentPlatformAdapter.build_system()` → OpenAI `<system>` 消息 |
+| 入站回调 | 插件内 `registerHttpRoute` | backend `AgentPlatformAdapter.send_turn()` 直调 |
+| 同步等 turn | `api.runtime.subagent.run` + `waitForRun` | `/v1/chat/completions` 同步 |
+| backend 生命周期 | OpenClaw 帮管 | runtime `register()` 拉起(`miloco-cli service restart`) |
+
+## 添加新 runtime 的 checklist
+
+1. `plugins/<runtime>/README.md` 写清楚架构图(参考 hermes 的)
+2. `plugins/<runtime>/install-<runtime>.sh` 按 9 步标准写
+3. `plugins/<runtime>/<runtime>_adapter/adapter.py` 实现 5 方法
+4. `plugins/<runtime>/tests/test_<feature>.py` 覆盖关键功能
+5. `knowledge/03-features/<runtime>-integration.md` 写架构 + 与 OpenClaw 差异
+6. 提交 PR(单主题)
+
+## 现状
+
+| runtime | 状态 | commit |
+|---|---|---|
+| openclaw | ✅ 默认(原厂支持) | upstream |
+| hermes | ✅ 本次 PR 落地(主线 8 项 + plugin 4 项 + 文档 6 项) | pr-hermes 27 commits |
+| langchain / crewai / autogen | 未来 | — |
