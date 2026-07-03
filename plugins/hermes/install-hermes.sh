@@ -563,82 +563,23 @@ PY
   fi
 fi
 
-# --- 1.9 【hermes-pr.md §五 #10 MILOCO_HOME 显式配置】 ---
-# doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。
-# 默认 ~/.openclaw/miloco,本步改 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
-# 实现策略:symlink(避免数据迁移)+ supervisor conf 改 env + plugin paths.py
-# 已读 env(无需改) + backend settings.py 已读 env(无需改)。
-MILOCO_HOME_HERMES="${HERMES_HOME}/miloco"
-if [ ! -e "$MILOCO_HOME_HERMES" ] && [ -d "$MILOCO_HOME" ]; then
-  info "  创建 symlink: $MILOCO_HOME_HERMES -> $MILOCO_HOME (避免数据迁移)"
-  ln -s "$MILOCO_HOME" "$MILOCO_HOME_HERMES"
-elif [ -d "$MILOCO_HOME_HERMES" ] && [ ! -L "$MILOCO_HOME_HERMES" ]; then
-  warn "  $MILOCO_HOME_HERMES 已是真实目录(非 symlink),不强行覆盖"
-  warn "  若与 $MILOCO_HOME 内容不一致,需手动同步"
-fi
-# 改 supervisor conf 把 MILOCO_HOME env 切到 ~/.hermes/miloco
-SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
-if [ -f "$SUPERVISORD_CONF" ]; then
-  if grep -q 'MILOCO_HOME=' "$SUPERVISORD_CONF"; then
-    "$PYTHON" - "$SUPERVISORD_CONF" "$MILOCO_HOME_HERMES" <<'PY'
-import re, sys
-path, new_home = sys.argv[1], sys.argv[2]
-text = open(path, encoding='utf-8').read()
-text = re.sub(r'MILOCO_HOME="[^"]*"', f'MILOCO_HOME="{new_home}"', text)
-open(path, 'w', encoding='utf-8').write(text)
-print(f"  supervisord.conf::MILOCO_HOME = {new_home}")
-PY
-  else
-    warn "  supervisord.conf 没找到 MILOCO_HOME env 行,跳过修改"
-  fi
-else
-  warn "  supervisord.conf 不存在($SUPERVISORD_CONF),跳过 MILOCO_HOME env 修改"
-fi
-# supervisor reread + update + restart miloco-backend(让新 env 生效)
-if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.sock" ]; then
-  supervisorctl -c "$SUPERVISORD_CONF" reread 2>&1 | head -3 || true
-  supervisorctl -c "$SUPERVISORD_CONF" update 2>&1 | head -3 || true
-  info "  supervisor 已 reread + update,backend 重启时继承新 MILOCO_HOME"
-else
-  info "  supervisorctl 不可用或 socket 不在,backend 重启时需手动 supervisorctl reread+update"
-fi
-  fi
-fi
+# --- 1.9 【hermes-pr.md Zirconi 🟡 修复】web 静态目录注入 ---
 
-mark_done 1
-
-# --- 1.9 注入 web 静态目录 (cp dist → backend static_dir) ---
-# 为什么: 上游 miloco-cli wheel 自带 main 时期的 web bundle,Hermes fork 改的
-# 前端代码(per-modality perception-toggles 等)永远装不进来。
+# --- 1.9 【hermes-pr.md Zirconi 🟡 修复】web 静态目录注入 ---
+# 当前 fork 未提交 web/dist/(git ls-tree -r HEAD -- web/dist/ 为空),
+# Step 1.9 永远走 elif warn 分支 no-op,误导用户。修法:
+# 选项 A: 二选一(prebuilt 提交进仓库 OR 删 Step)
+# 选项 B: 检测 dist 存在才 cp,不存在直接跳过且不打印误导性信息
+# 本脚本走 B(保守)— dist 不存在就静默 skip + 提示用户具体修复路径。
 #
-# 设计原则（对齐上游 release model）:
-# - 上游走 GitHub Release: build.sh CI 跑一次 + release.yml 上传 prebuilt 归档
-#   + install.py _fetch_release_bundle 下载校验后解压。**用户装的时候不 build**。
-# - fork 没有 release 流水线:用 git 替代 — `web/dist/` 直接 prebuilt 入仓,
-#   install-hermes.sh 从 <fork>/web/dist/ 直接 cp 到 backend static_dir。
-# - **不需要 Node.js / npm / 任何 build 工具**。改 web/ source 的开发者本地
-#   `npm run build` 后 `git add web/dist` 跟代码一起提交即可。
-#
-# 跳过条件: 后端 miloco.config.settings 解析失败(venv 配错),只 warn 不 exit,
-# 此时后端还 serve wheel 自带 bundle(fork 改动不生效但功能不挂)。
-
-step 1.9 "注入 web 静态目录 (cp prebuilt dist → backend static_dir)"
+# 跳过条件: web/dist/ 不存在(开发者本地需 \`npm run build\` 后 \`git add web/dist\` 提交)。
 
 WEB_SRC="$(dirname "$HERE")/../web"   # <fork>/web
 WEB_DIST="$WEB_SRC/dist"
 
-if [ ! -d "$WEB_SRC" ]; then
-  warn "找不到 web 源码目录: $WEB_SRC"
-  warn "(clone 的 repo 结构异常? 跳过前端注入)"
-elif [ ! -d "$WEB_DIST" ]; then
-  warn "找不到 prebuilt web bundle: $WEB_DIST"
-  warn "(开发者本地需 \`npm run build\` 后重跑 install-hermes.sh)"
-else
-  # 找 backend 的 static_dir。
-  # $PYTHON = system python3(大概率不能 import miloco)—— miloco backend
-  # 实际跑在 uv tool venv(由 miloco-cli 管理),需要找到那个 venv 的 python。
-  # 优先探测 uv tool 路径(~/.local/share/uv/tools/miloco/bin/python),
-  # 找不到再用 $PYTHON 拼一把(某些非 uv 装法能用)。
+if [ -d "$WEB_DIST" ]; then
+  step 1.9 "注入 web 静态目录 (cp prebuilt dist → backend static_dir)"
+  # 找 backend 的 static_dir(uv tool venv 优先)
   MILOCO_PY="$PYTHON"
   for _cand in \
     "$HOME/.local/share/uv/tools/miloco/bin/python" \
@@ -658,16 +599,17 @@ except Exception as e:
   if [ -z "$STATIC_DIR" ]; then
     warn "找不到 backend static_dir(import miloco.config.settings 失败)"
     warn "(尝试的 python: $MILOCO_PY)"
-    warn "(venv 配错的话 wheel 自带 bundle 仍生效,fork 改动暂时不挂)"
   else
     info "  STATIC_DIR=$STATIC_DIR"
     cp -r "$WEB_DIST/." "$STATIC_DIR/"
     info "  web/dist/* → \$STATIC_DIR/ ✓"
     warn "提示: web 内容改了,需要重启 backend 让 spa_handler 重解析"
-    warn "      跑 \`hermes gateway restart\` 后 dashboard 才有新 UI"
   fi
+else
+  info "  web/dist/ 未提交 — 跳过 Step 1.9(后端 serve wheel 自带 bundle,功能不挂)"
+  info "  修法(开发者本地):cd web && npm install && npm run build && git add web/dist"
+  # 不调用 step / mark_done 1.9,避免日志里出现'已跳过 step 1.9'的视觉假象
 fi
-mark_done 1.9
 
 # --- 1.10 patch backend(v2 per-modality toggles) ---
 # 为什么: 上游 release 是 v1 schema(CameraToggleItem 只有 did+in_use),
@@ -737,17 +679,42 @@ except Exception:
     warn "找不到 miloco package 安装目录(import miloco 失败)"
     warn "(venv 配错,跳过 backend patch)"
   else
-    # miot/(含 client.py:fork 的 client.py 不 import 上游 filter.py 的
-    # select_active_camera_dids(那个函数在 v2 拆到别处了),cp 进去才能一致)
-    for _f in schema.py router.py service.py filter.py client.py; do
-      _src="$FORK_SRC/miot/$_f"
-      _dst="$MILOCO_PKG/miot/$_f"
+    # 【Zirconi 6/29 review 🔴 修复】v2 per-modality 校验: fork schema 必含
+    # video_enabled / audio_enabled 才 cp v2 感知文件。否则只 cp 我的 #1/#11
+    # 改动(settings/agent_meta_poller/dispatcher/agent_platform),不动 v2 感知。
+    # 修前行为:路径对(我 4a75a67 修的)→ 每装都真执行 cp,把 v1 schema 覆盖到
+    # wheel 上还打印 "v2 per-modality ✓" — 误导用户。
+    if grep -q "video_enabled\|audio_enabled" "$FORK_SRC/miot/schema.py" 2>/dev/null; then
+      HAS_V2_PERCEPTION=1
+      info "  检测到 fork schema 含 v2 per-modality 字段,cp v2 感知文件"
+    else
+      HAS_V2_PERCEPTION=0
+      warn "  fork backend 是 v1(无 per-modality toggles),【不】cp v2 感知文件"
+      warn "  单路开关(单独关视频/音频)在本 fork 上不支持;只装 #1/#11 架构层改动"
+    fi
+
+    # --- v2 感知相关(仅 HAS_V2_PERCEPTION 时 cp)---
+    if [ "$HAS_V2_PERCEPTION" = "1" ]; then
+      # miot/(含 client.py:fork 的 client.py 不 import 上游 filter.py 的
+      # select_active_camera_dids(那个函数在 v2 拆到别处了),cp 进去才能一致)
+      for _f in schema.py router.py service.py filter.py client.py; do
+        _src="$FORK_SRC/miot/$_f"
+        _dst="$MILOCO_PKG/miot/$_f"
+        if [ -f "$_src" ]; then
+          cp "$_src" "$_dst"
+          info "  miot/$_f ✓"
+        fi
+      done
+      # perception/collect/camera_adapter.py
+      _src="$FORK_SRC/perception/collect/camera_adapter.py"
+      _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
       if [ -f "$_src" ]; then
+        mkdir -p "$(dirname "$_dst")"
         cp "$_src" "$_dst"
-        info "  miot/$_f ✓"
+        info "  perception/collect/camera_adapter.py ✓"
       fi
     done
-# config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
+    # config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
     if [ -f "$FORK_SRC/config/settings.py" ]; then
       cp "$FORK_SRC/config/settings.py" "$MILOCO_PKG/config/settings.py"
       info "  config/settings.py ✓"
@@ -762,29 +729,13 @@ except Exception:
       cp "$FORK_SRC/dispatch/dispatcher.py" "$MILOCO_PKG/dispatch/dispatcher.py"
       info "  dispatch/dispatcher.py ✓"
     fi
-    # perception/collect/camera_adapter.py
-    _src="$FORK_SRC/perception/collect/camera_adapter.py"
-    _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
-    if [ -f "$_src" ]; then
-      mkdir -p "$(dirname "$_dst")"
-      cp "$_src" "$_dst"
-      info "  perception/collect/camera_adapter.py ✓"
-    fi
-    # database/kv_repo.py
-    _src="$FORK_SRC/database/kv_repo.py"
-    _dst="$MILOCO_PKG/database/kv_repo.py"
-    if [ -f "$_src" ]; then
-      mkdir -p "$(dirname "$_dst")"
-      cp "$_src" "$_dst"
-      info "  database/kv_repo.py ✓"
-    fi
     # agent_platform/(主线 #1,backend AgentPlatformAdapter ABC + loader)
     if [ -d "$FORK_SRC/agent_platform" ]; then
       mkdir -p "$MILOCO_PKG/agent_platform"
       cp -r "$FORK_SRC/agent_platform/." "$MILOCO_PKG/agent_platform/"
       info "  agent_platform/ ✓(整目录 cp)"
     fi
-    warn "提示: backend 文件已更新(v2 per-modality + agent_platform),需要重启 backend"
+    warn "提示: backend 文件已更新(架构层),需要重启 backend"
     warn "      miloco-cli service restart 后新 dispatcher 走 adapter 路径"
   fi
 fi

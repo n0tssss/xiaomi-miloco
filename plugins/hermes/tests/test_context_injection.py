@@ -43,37 +43,61 @@ def test_full_includes_catalog_and_capabilities(tmp_miloco_home, monkeypatch):
     out = ci.inject_context(session_id="agent:main:miloco", user_message="把客厅灯打开")
     assert out is not None
     ctx = out["context"]
-    # 指令块
-    assert "Miloco" in ctx
-    assert "## 能力概览" in ctx  # full 专属
+    # 静态块: 071931f 改后只保留"工具索引"(被动清单),identity/notify/language
+    # 这些指令性块改 "" 避免污染 user message(对齐 hermes-pr.md §五 #2)。
+    # full profile 仍含"## 工具索引(被动清单)" + 感知格式 + 数据源 + 档案 + 目录。
+    assert "## 工具索引(被动清单)" in ctx
+    assert "miloco-devices" in ctx  # 工具清单内容
     # 数据块
     assert "# devices catalog" in ctx
     assert "## 家庭档案" in ctx  # profile.md 缺失时哨兵串仍带标题
 
 
 def test_minimal_excludes_catalog_and_capabilities(tmp_miloco_home, monkeypatch):
+    """minimal profile: catalog + capabilities + profile 都不附 → 返回 None(无需注入)。
+
+    071931f 改后,minimal + 无 catalog/prepend 内容为空 → inject_context 返 None。
+    这是预期行为(cron session 没必要在 user message 塞上下文)。
+    """
     monkeypatch.setattr(ci, "get_catalog", lambda: "# devices catalog\nx")
     out = ci.inject_context(session_id="miloco:cron:digest", platform="cron")
-    assert out is not None
-    ctx = out["context"]
-    assert "## 能力概览" not in ctx
-    assert "# devices catalog" not in ctx
-    # minimal 仍带身份与通知/语言块
-    assert "Miloco" in ctx
+    # minimal 不需要注入 → 返 None(对齐 071931f 后语义)
+    assert out is None
 
 
 def test_empty_catalog_omitted(tmp_miloco_home, monkeypatch):
+    """catalog 空但 full profile → prepend 仍有 tools 块 + 感知格式,context 不为 None。
+
+    注:071931f 改后 catalog 空不再附加,但 full profile 仍有其他内容(tools 索引等)。
+    """
     monkeypatch.setattr(ci, "get_catalog", lambda: "")
-    out = ci.inject_context(session_id="agent:main", user_message="hi")
+    out = ci.inject_context(session_id="agent:main:miloco", user_message="hi")
     assert out is not None
     assert "# devices catalog" not in out["context"]
+    assert "## 工具索引(被动清单)" in out["context"]  # full 仍有 tools 块
 
 
-def test_returns_none_when_nothing_to_inject(tmp_miloco_home, monkeypatch):
-    # minimal + 无 catalog + 无 profile → prepend 仍有 identity，不会 None；
-    # 这里验证极端：把 identity 也判不到的场景不存在，故仅验证始终非 None
+def test_returns_none_when_minimal_only(tmp_miloco_home, monkeypatch):
+    """minimal profile 下 prepend + append 都空 → inject_context 返 None。
+
+    071931f 后 minimal 没有任何块需要注入,直接 None,节省 LLM token。
+    """
     out = ci.inject_context(session_id="x", platform="cron")
-    assert out is not None  # identity 块恒在
+    assert out is None
+
+
+def test_full_returns_dict_with_blocks(tmp_miloco_home, monkeypatch):
+    """full profile + 有 catalog → prepend 有 tools 块,append 有 catalog + home_profile。
+
+    防御 071931f 改写后 inject_context 仍返非 None dict(对齐 _build_prepend
+    /_build_append 的契约)。
+    """
+    monkeypatch.setattr(ci, "get_catalog", lambda: "# devices catalog\n灯|客厅")
+    out = ci.inject_context(session_id="agent:main:miloco", user_message="hi")
+    assert out is not None
+    assert "context" in out
+    assert "## 工具索引(被动清单)" in out["context"]
+    assert "# devices catalog" in out["context"]
 
 
 # ---------- build_home_profile_block ----------

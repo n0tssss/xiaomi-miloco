@@ -47,7 +47,8 @@ miloco 通过 `plugins/hermes/` 接入 Hermes，作为 OpenClaw 之外的并列 
 **cron**（`cron/jobs.py::create_job`）：
 
 - `create_job(prompt, schedule, name=None, skills=None, deliver=None, ...)`。
-- `deliver` 是字符串（`"origin"/"local"/"none"/...`）；miloco 受管任务用 `"none"`。
+- `deliver` 必须是 Hermes `Platform` enum 合法值（`"telegram"`/`"feishu"`/`"weixin"`/`"discord"`/`"dingtalk"`/`"slack"`/`"email"`/`"whatsapp-cloud"` 等）；**禁止** `"all"` 或 `"none"` — `Platform("all")` / `Platform("none")` 不是合法 enum,会被 `DeliveryTarget.parse` 静默回退到 `Platform.LOCAL`,所有 cron 输出落到本地 markdown 而非 IM 推送(2026-07 修过的 critical bug 回归风险)。
+- **miloco 受管任务用 `state.json::deliver.target` 动态读取**(PR #279 早期版本硬编码 `"all"` 导致 bug,后改读 state.json);target 空时整个 reconcile 跳过,不传 `"none"` 兜底。
 - 无 `description` 字段，故把 `[miloco:home-profile]` 标签塞进 `name` 前缀作 reconcile 识别键。
 
 ### 版本兼容约束

@@ -111,11 +111,18 @@ def fake_hermes(monkeypatch):
     return _setter
 
 
-def test_notify_no_target_returns_clear_error(tmp_path: Path):
+def test_notify_no_target_returns_clear_error(tmp_path: Path, monkeypatch):
     ctx = _FakeCtx(tmp_path)
+    # 071931f 改 + hermes-pr.md §五 #4 完整迁移: notify_owner 改走
+    # resolve_notify_target 3 级 fallback。stale state.json + ~/.hermes/auth.json
+    # 真实配置会让 fallback 找到 feishu → 调 hermes send 卡住测试。
+    # 显式把 fallback 列表设空,确认 needsBind=true 路径。
+    from miloco_plugin_pkg import tools_notify as tn_local
+    monkeypatch.setattr(tn_local, "_detect_im_platforms_simple", lambda: [])
     result = tn.notify_owner(ctx, "hello")
     assert result["ok"] is False
-    assert "no deliver target configured" in result["error"]
+    assert result.get("needsBind") is True
+    assert "miloco_notify_bind" in result.get("hint", "")
 
 
 def test_notify_success(fake_hermes, tmp_path: Path):
@@ -232,12 +239,19 @@ def test_handler_empty_message(tmp_path: Path):
     assert "message" in out["error"]
 
 
-def test_handler_no_state_json(tmp_path: Path):
+def test_handler_no_state_json(tmp_path: Path, monkeypatch):
+    """handler 包装的 notify_owner 在 needsBind 路径下返 ok=false。
+
+    同 test_notify_no_target:monkeypatch 关掉 fallback,只走 needsBind 路径。
+    """
+    from miloco_plugin_pkg import tools_notify as tn_local
+
     ctx = _FakeCtx(tmp_path)
+    monkeypatch.setattr(tn_local, "_detect_im_platforms_simple", lambda: [])
     handler = tn.make_im_push_handler(ctx)
     out = json.loads(handler({"message": "hi"}))
     assert out["ok"] is False
-    assert "no deliver target" in out["error"]
+    assert out.get("needsBind") is True
 
 
 def test_handler_delivers(fake_hermes, tmp_path: Path):
