@@ -885,9 +885,15 @@ if [ -n "$old_baks" ]; then
   rm -f $old_baks
   info "  清理老 config.json.bak:保留最新 3 份"
 fi
-# 写 agent.platform='hermes'(backend dispatcher 据此走 adapter 路径;
-# 注意 Step 4.8 也写 platform,这里幂等覆盖,防御)
-"$PYTHON" - "$MILOCO_HOME" "hermes" <<'PY' || true
+# 【hermes-pr.md §五 #7 收敛】改用 miloco-cli config set 写 platform,plugin 不直接
+# 碰 config.json 的内部结构(走 CLI,未来 miloco 配置模型升级时 plugin 不需要适配)。
+# 与 Step 4.8 幂等(都写 platform,后写覆盖前写)。
+# --no-restart:本步不触发 service restart(由 install 全流程结束后用户/外部触发)。
+if miloco-cli config set agent.platform hermes --no-restart >/dev/null 2>&1; then
+  info "  agent.platform = hermes (via miloco-cli config set)"
+else
+  warn "  miloco-cli config set 失败,降级用 python 直写 config.json:"
+  "$PYTHON" - "$MILOCO_HOME" "hermes" <<'PY' || true
 import json, sys
 home, platform = sys.argv[1], sys.argv[2]
 p = f"{home}/config.json"
@@ -898,8 +904,9 @@ except Exception:
 cfg.setdefault("agent", {})
 cfg["agent"]["platform"] = platform
 json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-print(f"  agent.platform = {platform}")
+print(f"  agent.platform = {platform}(fallback)")
 PY
+fi
 mark_done 5
 
 # --- 6. patch ~/.hermes/.env（仅当缺失时追加）---
