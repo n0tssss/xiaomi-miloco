@@ -808,6 +808,53 @@ PY
 fi
 mark_done 4.7
 
+# --- 4.8 cp HermesAdapter 到 ${MILOCO_HOME}/agent_platform/hermes/ ---
+# hermes-pr.md §五 主线 #1:Backend AgentPlatformAdapter 通过 importlib 从这里加载 hermes 实现。
+# 完整路径 = $MILOCO_HOME/agent_platform/hermes/adapter.py,缺一即加载失败 → backend fallback webhook。
+# 同步写 settings.agent.platform="hermes",让 dispatcher 走 adapter 路径。
+# 注意 adapter 用 ``from .context_injection`` / ``.paths`` / ``.catalog`` 相对导入,
+# 这 3 个 sibling 模块必须一并 cp,否则 import 链断(adapter 不能跑)。
+step 4.8 "cp HermesAdapter → ${MILOCO_HOME}/agent_platform/hermes/"
+ADAPTER_DEST="$MILOCO_HOME/agent_platform/hermes"
+ADAPTER_SRC="$HERE/miloco-plugin/hermes_adapter"
+PLUGIN_SRC="$HERE/miloco-plugin"
+if [ ! -d "$ADAPTER_SRC" ]; then
+  warn "找不到 hermes_adapter 源目录: $ADAPTER_SRC"
+  warn "(plugin 结构异常? 跳过 adapter cp → backend 走 webhook 模式)"
+else
+  mkdir -p "$ADAPTER_DEST"
+  rm -rf "$ADAPTER_DEST"
+  cp -r "$ADAPTER_SRC" "$ADAPTER_DEST"
+  # 拷贝 adapter 相对导入的 3 个 sibling 模块(context_injection / paths / catalog)。
+  # 这些模块 plugin 本身也在用(legacy pre_llm_call),此处 cp 一份让 adapter package
+  # 自包含,后续如果 plugin 端 context_injection 改了,这里需同步(暂时手动)。
+  for _mod in context_injection.py paths.py catalog.py; do
+    if [ -f "$PLUGIN_SRC/$_mod" ]; then
+      cp "$PLUGIN_SRC/$_mod" "$ADAPTER_DEST/$_mod"
+    fi
+  done
+  info "  HermesAdapter → $ADAPTER_DEST ✓ (含 context_injection / paths / catalog 副本)"
+  # 写 settings.agent.platform="hermes"(backend 启动时按此加载 adapter)
+  if [ -f "$MILOCO_HOME/config.json" ]; then
+    "$PYTHON" - "$MILOCO_HOME" "hermes" <<'PY' 2>/dev/null || true
+import json, sys
+home, platform = sys.argv[1], sys.argv[2]
+p = f"{home}/config.json"
+try:
+    cfg = json.load(open(p, encoding="utf-8"))
+except Exception:
+    cfg = {}
+cfg.setdefault("agent", {})
+cfg["agent"]["platform"] = platform
+json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+print(f"  config.json::agent.platform = {platform}")
+PY
+  fi
+  warn "提示: backend 启动时自动加载 HermesAdapter,优先走 OpenAI 直调通路,"
+  warn "      旧的 :18789 webhook + 独立 adapter 进程将作为 fallback。"
+fi
+mark_done 4.8
+
 # --- 5. patch ${MILOCO_HOME}/config.json ---
 step 5 "patch ${MILOCO_HOME}/config.json 的 agent 段"
 # backup 文件名加 PID + 纳秒，避免 30s 内 reinstall 撞名

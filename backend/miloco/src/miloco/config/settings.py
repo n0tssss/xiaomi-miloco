@@ -91,11 +91,25 @@ class ServerSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
-    """Agent webhook 出站调用配置（与具体 agent 平台无关）。"""
+    """Agent 平台出站调用配置（推荐架构见 ``hermes-pr.md``）。
 
+    三段配置:
+    - ``platform``: 选 adapter,空走 webhook fallback(临时过渡,见 doc 主线)
+    - ``webhook_url`` + ``auth_bearer``: 旧 webhook 通路(PR #279),adapter 加载失败/未配时 fallback 用
+    - Adapter 自身配置(hermes_url / hermes_api_key 等)由 plugin 自己读
+      ``$MILOCO_HOME/agent_platform/<name>/config.yaml``,不写进 backend config.json
+    """
+
+    platform: str = Field(
+        default="",
+        description=(
+            "Agent 平台名;非空时 backend 按此从 $MILOCO_HOME/agent_platform/<name>/ 加载 Adapter"
+            "(hermes / openclaw / ...)。空时走 webhook 模式(PR #279 兼容,过渡期临时)。"
+        ),
+    )
     webhook_url: str = Field(
         default="http://127.0.0.1:18789/miloco/webhook",
-        description="agent webhook 回调地址",
+        description="agent webhook 回调地址(adapter 缺失/fallback 时用)",
     )
     auth_bearer: str = Field(
         default="",
