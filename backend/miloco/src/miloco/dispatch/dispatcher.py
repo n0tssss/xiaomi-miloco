@@ -22,6 +22,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from miloco.agent_platform import get_adapter
+from miloco.agent_platform.base import (
+    AdapterTransportError,
+    TurnContext,
+)
 from miloco.config import get_settings
 from miloco.middleware.exceptions import AgentWebhookException
 from miloco.observability.agent_meta_poller import AgentRunSource, track_agent_run
@@ -46,6 +51,28 @@ _ROUTE: dict[EventType, tuple[str, str, int]] = {
 
 # 仅这三类（== AgentRunSource）写 agent_runs；bind 不统计。
 _TRACKED: frozenset[EventType] = frozenset({"interaction", "rule", "suggestion"})
+
+
+# ---------------------------------------------------------------------------
+# Profile 解析(对齐 plugin context_injection.resolve_profile)
+# ---------------------------------------------------------------------------
+#
+# 迁移期临时实现: 完整 profile 决策逻辑在 plugin context_injection.py
+# (依赖 catalog / home_profile 等 plugin 资源),Backend 不应该反向 import plugin。
+# 这里只做 sessionKey 字符串嗅探,保证 rule / suggest / minimal(由 lane 隐式)
+# 分级正确。full / minimal 之外的细致差别在 Adapter.build_system 内复用 plugin
+# _build_prepend / _build_append(走 plugin context_injection 模块自身),Backend
+# 只传 profile 字符串 + extra dict,不复制 plugin 资源加载逻辑。
+
+
+def _resolve_profile(session_key: str, lane: str, event_type: EventType) -> str:
+    if event_type == "rule" or "miloco-rule" in session_key:
+        return "rule"
+    if event_type == "suggestion" or "miloco-suggest" in session_key or lane == "miloco-suggest":
+        return "suggestion"
+    if event_type == "bind":
+        return "minimal"
+    return "full"
 
 
 @dataclass(eq=False)
@@ -201,30 +228,38 @@ class AgentDispatcher:
         run_id: str | None = None
         status: str = "error"
         rtt_ms: float = 0.0
-        for attempt in range(self._TRANSPORT_RETRIES + 1):
-            try:
-                run_id, status, rtt_ms = await run_agent_turn(
-                    msg,
-                    session_key=session_key,
-                    lane=lane,
-                    trace_id=trace_id,
-                    wait_timeout_ms=wait_ms,
-                )
-                break
-            except AgentWebhookException as e:
-                # 传输失败（连接 / 5xx / HTTP 超时）→ 有限短退避重试,
-                # exhausted 后 WARN、跳过该批，继续下一批。
-                if attempt == self._TRANSPORT_RETRIES:
-                    logger.warning(
-                        "agent turn transport failed session=%s type=%s err=%s; "
-                        "skipping batch after %d attempts",
-                        session_key,
-                        event_type,
-                        e,
-                        attempt + 1,
+
+        # ----- 优先走 Adapter(hermes-pr.md §五 #1 主线);加载失败 fallback 到 webhook -----
+        adapter = get_adapter()
+        if adapter is not None:
+            run_id, status, rtt_ms = await self._send_via_adapter(
+                adapter, msg, session_key, lane, trace_id, wait_ms, event_type,
+            )
+        else:
+            for attempt in range(self._TRANSPORT_RETRIES + 1):
+                try:
+                    run_id, status, rtt_ms = await run_agent_turn(
+                        msg,
+                        session_key=session_key,
+                        lane=lane,
+                        trace_id=trace_id,
+                        wait_timeout_ms=wait_ms,
                     )
-                    return
-                await asyncio.sleep(self._TRANSPORT_BACKOFF_S * (2**attempt))
+                    break
+                except AgentWebhookException as e:
+                    # 传输失败（连接 / 5xx / HTTP 超时）→ 有限短退避重试,
+                    # exhausted 后 WARN、跳过该批，继续下一批。
+                    if attempt == self._TRANSPORT_RETRIES:
+                        logger.warning(
+                            "agent turn transport failed session=%s type=%s err=%s; "
+                            "skipping batch after %d attempts",
+                            session_key,
+                            event_type,
+                            e,
+                            attempt + 1,
+                        )
+                        return
+                    await asyncio.sleep(self._TRANSPORT_BACKOFF_S * (2**attempt))
 
         if status == "timeout":
             # 超时仅放行后续 turn、不终止平台在途 turn → WARN、跳过本批、继续下一批。
@@ -240,6 +275,56 @@ class AgentDispatcher:
             track_agent_run(
                 trace_id, run_id, cast(AgentRunSource, event_type), rtt_ms
             )
+
+    async def _send_via_adapter(
+        self,
+        adapter: Any,
+        msg: str,
+        session_key: str,
+        lane: str,
+        trace_id: str,
+        wait_ms: int,
+        event_type: EventType,
+    ) -> tuple[str | None, str, float]:
+        """通过 Adapter 直调 Agent 平台(hermes-pr.md §五 主线 #1)。
+
+        Adapter 失败(transport error)→ 同 webhook fallback 的有限短退避重试,
+        exhausted 后 WARN 跳过该批;status="timeout" / "error" 直接返回,不重试。
+        """
+        profile = _resolve_profile(session_key, lane, event_type)
+        ctx = TurnContext(
+            text=msg,
+            session_key=session_key,
+            lane=lane,
+            trace_id=trace_id,
+            wait_timeout_ms=wait_ms,
+            profile=profile,
+            extra={"event_type": event_type},
+        )
+        for attempt in range(self._TRANSPORT_RETRIES + 1):
+            try:
+                result = await adapter.send_turn(ctx)
+                return (
+                    getattr(result, "run_id", None),
+                    getattr(result, "status", "error"),
+                    float(getattr(result, "rtt_ms", 0.0)),
+                )
+            except AdapterTransportError as e:
+                if attempt == self._TRANSPORT_RETRIES:
+                    logger.warning(
+                        "adapter turn transport failed session=%s type=%s err=%s; "
+                        "skipping batch after %d attempts",
+                        session_key, event_type, e, attempt + 1,
+                    )
+                    return (None, "error", 0.0)
+                await asyncio.sleep(self._TRANSPORT_BACKOFF_S * (2**attempt))
+            except Exception as e:
+                logger.warning(
+                    "adapter turn unexpected error session=%s type=%s err=%s",
+                    session_key, event_type, e,
+                )
+                return (None, "error", 0.0)
+        return (None, "error", 0.0)  # unreachable, 让类型检查满意
 
 
 _singleton: AgentDispatcher | None = None
