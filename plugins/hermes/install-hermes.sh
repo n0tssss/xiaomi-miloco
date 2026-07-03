@@ -479,7 +479,7 @@ except Exception:
       fi
     fi
 
-    if [ -n "$FOUND_PY" ]; then
+if [ -n "$FOUND_PY" ]; then
       info "auto-fix: config.json::server.python_bin = $FOUND_PY"
       "$PYTHON" - "$MILOCO_HOME" "$FOUND_PY" <<'PY'
 import json, sys
@@ -494,9 +494,51 @@ cfg.setdefault("server", {})["python_bin"] = py_bin
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 PY
     else
-      warn "config.json::server.python_bin auto-fix 失败：找不到能 import miloco 的 python"
-      warn "手动修：${MILOCO_HOME}/config.json::server.python_bin = <装 miloco 包的 python 路径>"
+      warn "config.json::server.python_bin auto-fix 失败:找不到能 import miloco 的 python"
+      warn "手动修:${MILOCO_HOME}/config.json::server.python_bin = <装 miloco 包的 python 路径>"
     fi
+  fi
+fi
+
+# --- 1.9 【hermes-pr.md §五 #10 MILOCO_HOME 显式配置】 ---
+# doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。
+# 默认 ~/.openclaw/miloco,本步改 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
+# 实现策略:symlink(避免数据迁移)+ supervisor conf 改 env + plugin paths.py
+# 已读 env(无需改) + backend settings.py 已读 env(无需改)。
+MILOCO_HOME_HERMES="${HERMES_HOME}/miloco"
+if [ ! -e "$MILOCO_HOME_HERMES" ] && [ -d "$MILOCO_HOME" ]; then
+  info "  创建 symlink: $MILOCO_HOME_HERMES -> $MILOCO_HOME (避免数据迁移)"
+  ln -s "$MILOCO_HOME" "$MILOCO_HOME_HERMES"
+elif [ -d "$MILOCO_HOME_HERMES" ] && [ ! -L "$MILOCO_HOME_HERMES" ]; then
+  warn "  $MILOCO_HOME_HERMES 已是真实目录(非 symlink),不强行覆盖"
+  warn "  若与 $MILOCO_HOME 内容不一致,需手动同步"
+fi
+# 改 supervisor conf 把 MILOCO_HOME env 切到 ~/.hermes/miloco
+SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
+if [ -f "$SUPERVISORD_CONF" ]; then
+  if grep -q 'MILOCO_HOME=' "$SUPERVISORD_CONF"; then
+    "$PYTHON" - "$SUPERVISORD_CONF" "$MILOCO_HOME_HERMES" <<'PY'
+import re, sys
+path, new_home = sys.argv[1], sys.argv[2]
+text = open(path, encoding='utf-8').read()
+text = re.sub(r'MILOCO_HOME="[^"]*"', f'MILOCO_HOME="{new_home}"', text)
+open(path, 'w', encoding='utf-8').write(text)
+print(f"  supervisord.conf::MILOCO_HOME = {new_home}")
+PY
+  else
+    warn "  supervisord.conf 没找到 MILOCO_HOME env 行,跳过修改"
+  fi
+else
+  warn "  supervisord.conf 不存在($SUPERVISORD_CONF),跳过 MILOCO_HOME env 修改"
+fi
+# supervisor reread + update + restart miloco-backend(让新 env 生效)
+if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.sock" ]; then
+  supervisorctl -c "$SUPERVISORD_CONF" reread 2>&1 | head -3 || true
+  supervisorctl -c "$SUPERVISORD_CONF" update 2>&1 | head -3 || true
+  info "  supervisor 已 reread + update,backend 重启时继承新 MILOCO_HOME"
+else
+  info "  supervisorctl 不可用或 socket 不在,backend 重启时需手动 supervisorctl reread+update"
+fi
   fi
 fi
 
