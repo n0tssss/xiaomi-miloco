@@ -64,13 +64,42 @@ TOOLSET = "miloco"
 
 
 def register(ctx) -> None:
-    """注册 trace hooks + 5 个 tool, 并 reconcile 受管 cron。
+    """注册 trace hooks + 3 个 tool, 并 reconcile 受管 cron。
 
     【hermes-pr.md §五 #2 迁移后】删 ``pre_llm_call`` 注册 —— prompt 注入改走 backend
     HermesAdapter + OpenAI ``<system>`` 通路。这里只保留工具 / trace / cron 三类。
 
+    【hermes-pr.md §五 #8 迁移后】register 触发 miloco backend 启动(原本由
+    install-hermes.sh 负责;新架构下 plugin 启动应保证 backend 在线, 否则
+    cron / trace / tool 都没 backend 可调)。``miloco-cli service restart`` 是幂等 +
+    超时可控,且不影响 hermes gateway 进程组。
+
     每个注册独立 try/except: 单个失败不影响其余功能, 也绝不让插件加载崩掉 Hermes。
     """
+    # ── 【hermes-pr.md §五 #8】register 触发 miloco backend 启动 ─────────────
+    # 幂等: backend 已跑 → restart 是 no-op(service status 报告 running 即跳过)
+    try:
+        import shutil
+        import subprocess
+        if shutil.which("miloco-cli"):
+            result = subprocess.run(
+                ["miloco-cli", "service", "restart"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                logger.info("[miloco-backend] register 触发 backend restart: ok")
+            else:
+                logger.warning(
+                    "[miloco-backend] register 触发 restart 失败 rc=%s stderr=%s",
+                    result.returncode, (result.stderr or "")[:200],
+                )
+        else:
+            logger.warning("[miloco-backend] miloco-cli 不在 PATH,跳过 register 拉后端")
+    except subprocess.TimeoutExpired:
+        logger.warning("[miloco-backend] register 触发 restart 超时(30s)")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[miloco-backend] register 触发 restart 异常: %s", exc)
+
     # ── trace hooks(6 事件: pre/post_llm_call + pre/post_tool_call + on_session_start/end) ──
     # 对齐 OpenClaw trace.ts: debug 模式写 $MILOCO_HOME/trace/agent/<date>/*.jsonl.gz + .meta.json
     # 【hermes-pr.md §五 #11 迁移后】应改为常写(去掉 debug 门槛),backend HermesAdapter.read_trace_meta 读盘
