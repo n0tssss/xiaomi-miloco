@@ -43,9 +43,11 @@ def test_full_includes_catalog_and_capabilities(tmp_miloco_home, monkeypatch):
     out = ci.inject_context(session_id="agent:main:miloco", user_message="把客厅灯打开")
     assert out is not None
     ctx = out["context"]
-    # 指令块
-    assert "Miloco" in ctx
-    assert "## 能力概览" in ctx  # full 专属
+    # 静态块: 071931f 改后只保留"工具索引"(被动清单),identity/notify/language
+    # 这些指令性块改 "" 避免污染 user message(对齐 hermes-pr.md §五 #2)。
+    # full profile 仍含"## 工具索引(被动清单)" + 感知格式 + 数据源 + 档案 + 目录。
+    assert "## 工具索引(被动清单)" in ctx
+    assert "miloco-devices" in ctx  # 工具清单内容
     # 数据块
     assert "# devices catalog" in ctx
     assert "## 家庭档案" in ctx  # profile.md 缺失时哨兵串仍带标题
@@ -56,10 +58,12 @@ def test_minimal_excludes_catalog_and_capabilities(tmp_miloco_home, monkeypatch)
     out = ci.inject_context(session_id="miloco:cron:digest", platform="cron")
     assert out is not None
     ctx = out["context"]
-    assert "## 能力概览" not in ctx
+    # minimal 不附工具索引、感知格式、目录
+    assert "## 工具索引(被动清单)" not in ctx
     assert "# devices catalog" not in ctx
-    # minimal 仍带身份与通知/语言块
-    assert "Miloco" in ctx
+    # minimal 仍可有感知格式(rule 也要)
+    # 但 minimal 的"感知格式"块也省略(对齐 _build_prepend minimal 分支)
+    assert "voice" not in ctx or "[感知引擎]语音提醒" not in ctx
 
 
 def test_empty_catalog_omitted(tmp_miloco_home, monkeypatch):
@@ -70,10 +74,11 @@ def test_empty_catalog_omitted(tmp_miloco_home, monkeypatch):
 
 
 def test_returns_none_when_nothing_to_inject(tmp_miloco_home, monkeypatch):
-    # minimal + 无 catalog + 无 profile → prepend 仍有 identity，不会 None；
-    # 这里验证极端：把 identity 也判不到的场景不存在，故仅验证始终非 None
+    # 071931f 后 identity/capabilities/notify/language 块均已对齐"事实陈述",
+    # 即便 minimal + 无 catalog + 无 profile,prepend 还有数据源 + 感知格式子集
+    # → inject_context 始终非 None。
     out = ci.inject_context(session_id="x", platform="cron")
-    assert out is not None  # identity 块恒在
+    assert out is not None
 
 
 # ---------- build_home_profile_block ----------

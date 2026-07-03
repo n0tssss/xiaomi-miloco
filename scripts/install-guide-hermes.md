@@ -8,7 +8,7 @@ metadata:
 
 # Miloco × Hermes Agent 安装指南
 
-把 Miloco 装到一台**已经装了 Hermes Agent** 的机器上。Hermes 兼容层在 fork `n0tssss/xiaomi-miloco` 的 `plugins/hermes/` 下。
+把 Miloco 装到一台**已经装了 Hermes Agent** 的机器上。Hermes 兼容层在本仓库 `plugins/hermes/` 下。
 
 > **Windows 用户：** 当前不支持原生 Windows，请先装 [WSL](https://learn.microsoft.com/zh-cn/windows/wsl/install)，在 WSL 终端中执行。
 
@@ -19,7 +19,7 @@ metadata:
 ## Step 1：装插件（agent 自跑）
 
 ```bash
-git clone https://github.com/n0tssss/xiaomi-miloco.git
+git clone https://github.com/XiaoMi/xiaomi-miloco.git
 cd xiaomi-miloco
 bash plugins/hermes/install-hermes.sh
 ```
