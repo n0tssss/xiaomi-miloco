@@ -737,16 +737,51 @@ except Exception:
     warn "找不到 miloco package 安装目录(import miloco 失败)"
     warn "(venv 配错,跳过 backend patch)"
   else
-    # miot/(含 client.py:fork 的 client.py 不 import 上游 filter.py 的
-    # select_active_camera_dids(那个函数在 v2 拆到别处了),cp 进去才能一致)
-    for _f in schema.py router.py service.py filter.py client.py; do
-      _src="$FORK_SRC/miot/$_f"
-      _dst="$MILOCO_PKG/miot/$_f"
+    # 【Zirconi 6/29 review 🔴 修复】v2 per-modality 校验: fork schema 必含
+    # video_enabled / audio_enabled 才 cp v2 感知文件。否则只 cp 我的 #1/#11
+    # 改动(settings/agent_meta_poller/dispatcher/agent_platform),不动 v2 感知。
+    # 修前行为:路径对(我 4a75a67 修的)→ 每装都真执行 cp,把 v1 schema 覆盖到
+    # wheel 上还打印 "v2 per-modality ✓" — 误导用户。
+    if grep -q "video_enabled\|audio_enabled" "$FORK_SRC/miot/schema.py" 2>/dev/null; then
+      HAS_V2_PERCEPTION=1
+      info "  检测到 fork schema 含 v2 per-modality 字段,cp v2 感知文件"
+    else
+      HAS_V2_PERCEPTION=0
+      warn "  fork backend 是 v1(无 per-modality toggles),【不】cp v2 感知文件"
+      warn "  单路开关(单独关视频/音频)在本 fork 上不支持;只装 #1/#11 架构层改动"
+    fi
+
+    # --- v2 感知相关(仅 HAS_V2_PERCEPTION 时 cp)---
+    if [ "$HAS_V2_PERCEPTION" = "1" ]; then
+      # miot/(含 client.py:fork 的 client.py 不 import 上游 filter.py 的
+      # select_active_camera_dids(那个函数在 v2 拆到别处了),cp 进去才能一致)
+      for _f in schema.py router.py service.py filter.py client.py; do
+        _src="$FORK_SRC/miot/$_f"
+        _dst="$MILOCO_PKG/miot/$_f"
+        if [ -f "$_src" ]; then
+          cp "$_src" "$_dst"
+          info "  miot/$_f ✓"
+        fi
+      done
+      # perception/collect/camera_adapter.py
+      _src="$FORK_SRC/perception/collect/camera_adapter.py"
+      _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
       if [ -f "$_src" ]; then
+        mkdir -p "$(dirname "$_dst")"
         cp "$_src" "$_dst"
-        info "  miot/$_f ✓"
+        info "  perception/collect/camera_adapter.py ✓"
       fi
-    done
+      # database/kv_repo.py
+      _src="$FORK_SRC/database/kv_repo.py"
+      _dst="$MILOCO_PKG/database/kv_repo.py"
+      if [ -f "$_src" ]; then
+        mkdir -p "$(dirname "$_dst")"
+        cp "$_src" "$_dst"
+        info "  database/kv_repo.py ✓"
+      fi
+    fi
+
+    # --- 架构层(无条件 cp,fork 这些文件已稳定)---
     # config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
     if [ -f "$FORK_SRC/config/settings.py" ]; then
       cp "$FORK_SRC/config/settings.py" "$MILOCO_PKG/config/settings.py"
@@ -762,29 +797,13 @@ except Exception:
       cp "$FORK_SRC/dispatch/dispatcher.py" "$MILOCO_PKG/dispatch/dispatcher.py"
       info "  dispatch/dispatcher.py ✓"
     fi
-    # perception/collect/camera_adapter.py
-    _src="$FORK_SRC/perception/collect/camera_adapter.py"
-    _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
-    if [ -f "$_src" ]; then
-      mkdir -p "$(dirname "$_dst")"
-      cp "$_src" "$_dst"
-      info "  perception/collect/camera_adapter.py ✓"
-    fi
-    # database/kv_repo.py
-    _src="$FORK_SRC/database/kv_repo.py"
-    _dst="$MILOCO_PKG/database/kv_repo.py"
-    if [ -f "$_src" ]; then
-      mkdir -p "$(dirname "$_dst")"
-      cp "$_src" "$_dst"
-      info "  database/kv_repo.py ✓"
-    fi
     # agent_platform/(主线 #1,backend AgentPlatformAdapter ABC + loader)
     if [ -d "$FORK_SRC/agent_platform" ]; then
       mkdir -p "$MILOCO_PKG/agent_platform"
       cp -r "$FORK_SRC/agent_platform/." "$MILOCO_PKG/agent_platform/"
       info "  agent_platform/ ✓(整目录 cp)"
     fi
-    warn "提示: backend 文件已更新(v2 per-modality + agent_platform),需要重启 backend"
+    warn "提示: backend 文件已更新(架构层),需要重启 backend"
     warn "      miloco-cli service restart 后新 dispatcher 走 adapter 路径"
   fi
 fi
