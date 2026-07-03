@@ -658,8 +658,14 @@ except Exception:
       cp "$_src" "$_dst"
       info "  database/kv_repo.py ✓"
     fi
-    warn "提示: backend 文件已更新(v2 per-modality),需要重启 backend"
-    warn "      miloco-cli service restart 后单路开关才生效"
+    # agent_platform/(主线 #1,backend AgentPlatformAdapter ABC + loader)
+    if [ -d "$FORK_SRC/agent_platform" ]; then
+      mkdir -p "$MILOCO_PKG/agent_platform"
+      cp -r "$FORK_SRC/agent_platform/." "$MILOCO_PKG/agent_platform/"
+      info "  agent_platform/ ✓(整目录 cp)"
+    fi
+    warn "提示: backend 文件已更新(v2 per-modality + agent_platform),需要重启 backend"
+    warn "      miloco-cli service restart 后新 dispatcher 走 adapter 路径"
   fi
 fi
 mark_done 1.10
