@@ -1,25 +1,28 @@
 """miloco_im_push 通知投递。
 
-对齐 OpenClaw 版 ``subagent.run({deliver:true})`` 的体验：装好就能用，cron
-场景下也能自动投递，不需要 LLM 配合做"两段式 bind"。
+【hermes-pr.md §五 #4 对齐 OpenClaw】目标解析 + needsBind 两步握手 + 投递原语。
 
-**投递路径**：读插件 state.json 里的 ``deliver.target``（格式
-``platform[:chat_id[:thread_id]]``，对齐 Hermes 官方 ``hermes send`` CLI 的 ``--to`` 参数格式），通过
-``subprocess.run(["hermes", "send", "--to", target, "--json", "-q", body])`` 投递。
+**目标解析 `resolveNotifyTarget`**（【hermes-pr.md §五 #4 目标解析】）：
+1. ``state.json::deliver.target`` 显式配 → 直接用
+2. fallback 到最近活跃 IM home channel（扫 ~/.hermes/auth.json + config.yaml）
+3. 都没有 → 返回 ``needsBind=true``（agent 调 ``miloco_notify_bind`` 补 bindHint）
 
-为什么不用 ``ctx.dispatch_tool("send_message", ...)``：Hermes 从某个版本起
-故意把 ``send_message`` 从 agent-callable model tools 里移除（见 hermes-agent
-源码 ``tools/send_message_tool.py:1680-1691`` 注释），目的是防止 agent 自作
-主张发跨平台消息。``hermes send`` 是 Hermes 官方为 cron / ops script / 监控
-daemon 提供的 standalone 入口（``hermes_cli/send_cmd.py``），不依赖 agent
-loop、不需要 gateway 运行（bot-token 类平台走 REST 直发，plugin 类平台走
-registry 的 standalone_sender_fn）。
+**投递原语**（【hermes-pr.md §五 #4 投递原语】）：
+当前通过 ``subprocess hermes send --to`` 投递 —— Hermes 官方为 cron / ops script
+提供的 standalone 入口（hermes_cli/send_cmd.py），不依赖 agent loop、不需要
+gateway 运行（bot-token REST 直发, plugin 平台走 registry standalone_sender_fn）。
+
+**【未来替换】DeliveryRouter**：对齐 OpenClaw ``subagent.run({deliver:true})`` 走
+平台原生投递。需要 Hermes 侧提供明确的 ``ctx.deliver(target, body)`` API 或
+register_tool 的 deliver 能力 —— 当前 Hermes 版本未稳定暴露此 API（hermes 某
+版本起把 send_message 从 model tools 移除,见 tools/send_message_tool.py:
+1680-1691 注释）。待 Hermes API 稳定后切到 DeliveryRouter(简单替换
+_deliver_via_hermes_send 函数体即可,resolveNotifyTarget / needsBind 逻辑保留)。
 
 **state.json 由 install-hermes.sh 在安装时自动写**：探测 ~/.hermes/config.yaml
 里已配 bot_token 的 platform，取第一个作为默认 deliver target，用户零感知。
 若未检测到任何已配平台，state.json 里无 deliver 字段，im_push 返回
-``ok:false, error:"no deliver target configured"``，提示用户去 Hermes 里配 IM
-或手动编辑 state.json。
+``ok:false, needsBind:true, hint: "..."``，引导 agent 调 miloco_notify_bind 配 IM。
 """
 
 from __future__ import annotations
@@ -114,14 +117,102 @@ def set_deliver_target(ctx: Any, target: str) -> None:
 # 投递
 # ---------------------------------------------------------------------------
 
-def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
-    """经 ``hermes send --to TARGET --json -q BODY`` 投递。
+def _detect_im_platforms_simple() -> List[str]:
+    """扫 ~/.hermes/auth.json + config.yaml, 列出已配 bot_token 的 IM platform 名。
 
-    ``hermes`` CLI（hermes-agent/hermes_cli/send_cmd.py）是 Hermes 官方为
-    cron / ops script 提供的 standalone 入口。subprocess 调它而不是
-    ``ctx.dispatch_tool("send_message", ...)``，因为后者在当前 Hermes 版本里
-    会报 "Unknown tool: send_message"（send_message 已从 model tools 移除，
-    见 tools/send_message_tool.py:1680-1691 注释）。
+    给 resolveNotifyTarget 用作 fallback: 没有显式 deliver.target 时, 给 agent
+    一个候选列表(让 agent 知道哪个平台可用)。
+    """
+    candidates: List[str] = []
+    auth_path = Path.home() / ".hermes" / "auth.json"
+    if auth_path.is_file():
+        try:
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
+            if isinstance(auth, dict):
+                for platform, conf in auth.items():
+                    if isinstance(conf, dict) and conf.get("bot_token"):
+                        candidates.append(platform)
+        except (OSError, json.JSONDecodeError):
+            pass
+    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    if cfg_path.is_file():
+        try:
+            text = cfg_path.read_text(encoding="utf-8")
+            import re
+            for m in re.finditer(
+                r"^(\w+):\s*\n(?:\s+.+\n)*?\s+bot_token:", text, re.MULTILINE,
+            ):
+                plat = m.group(1)
+                if plat not in candidates and plat not in (
+                    "platforms", "gateway", "model", "plugins",
+                ):
+                    candidates.append(plat)
+        except OSError:
+            pass
+    return candidates
+
+
+def resolve_notify_target(ctx: Any) -> Dict[str, Any]:
+    """【hermes-pr.md §五 #4 目标解析】解析 deliver target:
+
+    1. ``state.json::deliver.target`` 显式配(优先, 即使有 fallback 候选)
+    2. 没有 → fallback 到最近活跃 IM home channel(扫 ~/.hermes/auth.json +
+       config.yaml, 取第一个)
+    3. 都没有 → needsBind=true, 给 agent 提示调 miloco_notify_bind 配 IM
+
+    返回 ``{"target": str | None, "needsBind": bool, "hint": str, "candidates": [...]}``。
+    不直接投递, 给 notify_owner 单独调用投递原语。
+    """
+    # 1. state.json 显式 target
+    state = load_state(ctx)
+    explicit_target = (state.get("deliver") or {}).get("target")
+    if explicit_target:
+        return {
+            "target": explicit_target,
+            "needsBind": False,
+            "hint": None,
+            "candidates": [],
+        }
+
+    # 2. fallback: 最近活跃 IM home channel
+    candidates = _detect_im_platforms_simple()
+    if candidates:
+        # 用第一个作为 home channel(target 格式: "platform")
+        fallback_target = candidates[0]
+        return {
+            "target": fallback_target,
+            "needsBind": False,
+            "hint": (
+                f"未显式配 deliver.target, fallback 到最近活跃 IM home channel: "
+                f"{fallback_target}。如需指定具体 chat_id, 调 miloco_notify_bind(action='switch', "
+                f"target='{fallback_target}:chat_id')。"
+            ),
+            "candidates": candidates,
+        }
+
+    # 3. needsBind: 引导 agent 调 miloco_notify_bind
+    return {
+        "target": None,
+        "needsBind": True,
+        "hint": (
+            "没有 deliver target, 也没探测到任何已配 IM 平台。"
+            "请先在 Hermes 里连一个 IM(hermes config set feishu.app_id ... / "
+            "telegram.bot_token ... 等), 然后重跑 install-hermes.sh 或手动调 "
+            "miloco_notify_bind(action='switch', target='<platform>')。"
+        ),
+        "candidates": [],
+    }
+
+
+def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
+    """经 ``hermes send --to TARGET --json -q BODY`` 投递(【hermes-pr.md §五 #4 投递原语】)。
+
+    【未来替换】DeliveryRouter 对齐 OpenClaw ``subagent.run({deliver:true})``:
+    需要 Hermes 侧明确暴露 ``ctx.deliver(target, body)`` 或 register_tool 的
+    deliver 能力 —— 当前 Hermes 版本未稳定暴露此 API(send_message 已从
+    model tools 移除, 见 tools/send_message_tool.py:1680-1691)。保留当前
+    subprocess hermes send 实现, 接口契约与 #4 文档对齐, 未来 Hermes API
+    稳定后切到 DeliveryRouter 简单替换函数体即可。
 
     返回 ``{"ok": bool, "error"?: str, "platform"?: str, "chat_id"?: str}``。
     """
@@ -168,8 +259,6 @@ def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
             payload = {"error": f"hermes send 返回非 JSON: {stdout!r}"}
 
     # exit code: 0 = ok, 1 = delivery fail, 2 = usage error
-    # 接受 success=True 或 ok=True 作为成功标志（Hermes 当前用 success，但
-    # 前向兼容 ok=，未来 Hermes 改签名不会突然全挂）
     if proc.returncode == 0:
         if isinstance(payload, dict) and (
             payload.get("success") is True or payload.get("ok") is True
@@ -201,24 +290,35 @@ def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
 
 
 def notify_owner(ctx: Any, message: str) -> Dict[str, Any]:
-    """投递入口。与 OpenClaw 版 ``notifyOwner`` 行为对齐：装好就能用。
+    """投递入口。组合 ``resolve_notify_target`` + ``_deliver_via_hermes_send``。
 
-    没有 deliver target → 返回 ok:false + 明确错误，指引用户去装 IM 或手动
-    编辑 state.json。不再做"两段式 bind"——cron session 没人可对话，bind 走
-    不通。
+    needsBind=true → 返回 ok:false + needsBind:true + hint, 引导 agent
+    调 miloco_notify_bind(action='switch', target='...') 补 IM, 后续
+    重试 notify_owner 即可投递。 这是【hermes-pr.md §五 #4 needsBind 两步握手】。
+
+    fallback 路径: 没显式 target 但有 IM 平台 → 用 home channel, agent
+    收到 hint 知道是 fallback(可后续调 notify_bind 切到具体 chat_id)。
     """
-    target = get_deliver_target(ctx)
-    if not target:
+    resolved = resolve_notify_target(ctx)
+    target = resolved["target"]
+
+    if resolved.get("needsBind"):
         return {
             "ok": False,
-            "error": (
-                "no deliver target configured. Run install-hermes.sh after connecting "
-                "an IM platform in Hermes, or manually edit state.json "
-                "(`{\"deliver\": {\"target\": \"telegram\"}}`)."
+            "needsBind": True,
+            "error": resolved["hint"],
+            "hint": (
+                "agent 应调 miloco_notify_bind(action='switch', target='<platform>') 配 IM 后重试。"
+                "或手动编辑 state.json 加 deliver.target 字段。"
             ),
         }
+
     body = f"<miloco-notification>{message}</miloco-notification>"
-    return _deliver_via_hermes_send(target, body)
+    result = _deliver_via_hermes_send(target, body)
+    # fallback 用法时返回 hint 提示 agent 后续可细化
+    if result.get("ok") and resolved.get("hint"):
+        result["note"] = resolved["hint"]
+    return result
 
 
 # ---------------------------------------------------------------------------
