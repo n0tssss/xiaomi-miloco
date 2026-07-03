@@ -236,30 +236,30 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
     diag "plugin enabled" 0 "找不到 hermes CLI"
   fi
 
-  # 10. adapter 在跑
+  # 10. 【hermes-pr.md §五 #1 完成】独立 adapter 进程已弃用,改为提示
+  # 期望:adapter launchd 已清理 / 端口 18789 无进程。
+  # 若发现残留 → warn(可能 PR #279 未干净)而不是 fail,不影响诊断通过。
+  _STALE_ADAPTER=0
   if [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
-    # macOS launchd 路径：直接看 launchctl list
     if launchctl list 2>/dev/null | grep -q "com.xiaomi.miloco.hermes.adapter"; then
-      diag "adapter (launchd)" 1 "已加载 com.xiaomi.miloco.hermes.adapter"
-    else
-      diag "adapter (launchd)" 0 "未加载 → bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh start"
+      diag "adapter (launchd)" 1 "⚠ 已清理/弃用(PR #279 残留 launchd) — 新架构无独立 adapter"
+      _STALE_ADAPTER=1
     fi
-  elif get_pid_by_port "$ADAPTER_PORT" >/dev/null 2>&1 && [ -n "$(get_pid_by_port "$ADAPTER_PORT" | tr -d ' \r\n')" ]; then
-    ADAPTER_PID_VAL="$(get_pid_by_port "$ADAPTER_PORT" | tr -d ' \r\n' | head -1)"
-    diag "adapter 进程 (端口 $ADAPTER_PORT)" 1 "PID=$ADAPTER_PID_VAL"
-  else
-    diag "adapter 进程" 0 "bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh start"
+  fi
+  if [ "$_STALE_ADAPTER" -eq 0 ]; then
+    diag "adapter (launchd)" 1 "N/A(新架构,backend AgentPlatformAdapter 直调;无独立进程)"
   fi
 
-  # 11. adapter /health
+  # 11. 【hermes-pr.md §五 #1 完成】adapter /health 同样 N/A
   ADAPTER_HEALTH=""
-  if command -v curl >/dev/null 2>&1; then
+  if command -v curl >/dev/null 2>&1 && [ "$_STALE_ADAPTER" -eq 1 ]; then
     ADAPTER_HEALTH="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$ADAPTER_PORT/health" 2>/dev/null || echo "")"
+    if [ "$ADAPTER_HEALTH" = "200" ]; then
+      diag "adapter /health" 1 "⚠ 端口 $ADAPTER_PORT 还响应 HTTP 200(原独立 adapter 残留,请清)"
+    fi
   fi
-  if [ "$ADAPTER_HEALTH" = "200" ]; then
-    diag "adapter /health" 1 "HTTP 200"
-  else
-    diag "adapter /health" 0 "HTTP ${ADAPTER_HEALTH:-no-response} — 看 $HERMES_HOME/miloco-adapter.log 末尾"
+  if [ "$_STALE_ADAPTER" -eq 0 ]; then
+    diag "adapter /health" 1 "N/A(新架构,无独立 adapter 进程)"
   fi
 
   # 12. state.json::deliver.target
@@ -699,29 +699,21 @@ mkdir -p "$HERMES_HOME/skills"
 cp -r "$HERE/skills"/miloco-* "$HERMES_HOME/skills/"
 mark_done 3
 
-# --- 4. 复制插件 + adapter ---
-step 4 "复制 Hermes 插件 + adapter → ${HERMES_PLUGINS_DIR}/"
+# --- 4. 复制插件 ---
+# 【hermes-pr.md §五 #1 完成】删除原"独立 aiohttp adapter 进程"栈:
+#   - plugins/hermes/adapter/ 不再 cp(整个目录即将从 repo 删)
+#   - scripts/miloco-adapter.sh / adapter-launcher.sh / com.xiaomi.miloco.hermes.adapter.plist
+#     不再 cp / chmod(没有独立进程了)
+# 入站改走 backend AgentPlatformAdapter -> HermesAdapter -> OpenAI /v1/chat/completions,
+# Adapter 随 plugin 装到 $MILOCO_HOME/agent_platform/hermes/(见 Step 4.8)。
+step 4 "复制 Hermes 插件 → ${HERMES_PLUGINS_DIR}/"
 mkdir -p "$HERMES_PLUGINS_DIR"
 info "  复制 miloco-plugin/"
 rm -rf "$HERMES_PLUGINS_DIR/miloco-plugin"
 cp -r "$HERE/miloco-plugin" "$HERMES_PLUGINS_DIR/miloco-plugin"
-info "  复制 adapter/"
-rm -rf "$HERMES_PLUGINS_DIR/adapter"
-cp -r "$HERE/adapter" "$HERMES_PLUGINS_DIR/adapter"
 # 清 pycache + 预编译（首次启动少 ~2s）
 find "$HERMES_PLUGINS_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
-"$PYTHON" -m compileall -q "$HERMES_PLUGINS_DIR/miloco-plugin" "$HERMES_PLUGINS_DIR/adapter" 2>/dev/null || true
-
-# adapter-launcher.sh 要可执行（macOS launchd plist 调它）
-chmod +x "$HERE/scripts/adapter-launcher.sh" 2>/dev/null || true
-
-# 把 adapter 启停脚本复制到 plugins/ 下（agent / 自检工具按固定路径找）
-# 之前只 chmod 不复制，导致 miloco_status fix 提示的 `bash plugins/hermes/scripts/miloco-adapter.sh start`
-# 在用户 cwd 不是 fork 根目录时找不到。复到 ~/.hermes/plugins/miloco/ 下后绝对路径稳定。
-info "  复制 miloco-adapter.sh（adapter 启停 wrapper）"
-mkdir -p "$HERMES_PLUGINS_DIR/scripts"
-cp -f "$HERE/scripts/miloco-adapter.sh" "$HERMES_PLUGINS_DIR/scripts/miloco-adapter.sh"
-chmod +x "$HERMES_PLUGINS_DIR/scripts/miloco-adapter.sh"
+"$PYTHON" -m compileall -q "$HERMES_PLUGINS_DIR/miloco-plugin" 2>/dev/null || true
 mark_done 4
 
 # --- 4.5 自动探测 Hermes 已配置的 IM 平台，写入插件 state.json ---
@@ -872,29 +864,36 @@ fi
 mark_done 4.8
 
 # --- 5. patch ${MILOCO_HOME}/config.json ---
-step 5 "patch ${MILOCO_HOME}/config.json 的 agent 段"
-# backup 文件名加 PID + 纳秒，避免 30s 内 reinstall 撞名
+step 5 "patch ${MILOCO_HOME}/config.json 的 agent 段(平台名)"
+# 【hermes-pr.md §五 #1 完成】原 PR #279 写 webhook_url + auth_bearer 给独立 adapter 进程
+# 用;现在 agent 只剩 platform 字段(backend 按此加载 Adapter),webhook_url/auth_bearer
+# 由 AgentPlatformAdapter 启动时读 $MILOCO_HOME/agent_platform/<name>/ 自管。
+
+# backup 文件名加 PID + 纳秒,避免 30s 内 reinstall 撞名
 TS="$(date +%Y%m%d-%H%M%S)-pid$$-nsec$(date +%N)"
 cp "$MILOCO_HOME/config.json" "${MILOCO_HOME}/config.json.bak-${TS}"
 
-# 清理老备份：保留最新 3 份，避免 config.json.bak-* 累积（重装 N 次 → N 份）
-# 用 ls -1t 按时间倒序，tail -n +4 跳过前 3 行（即保留最新 3），其余删
+# 清理老备份：保留最新 3 份,避免 config.json.bak-* 累积(重装 N 次 → N 份)
+# 用 ls -1t 按时间倒序,tail -n +4 跳过前 3 行(即保留最新 3),其余删
 old_baks="$(ls -1t "${MILOCO_HOME}"/config.json.bak-* 2>/dev/null | tail -n +4 || true)"
 if [ -n "$old_baks" ]; then
   rm -f $old_baks
-  info "  清理老 config.json.bak：保留最新 3 份"
+  info "  清理老 config.json.bak:保留最新 3 份"
 fi
-"$PYTHON" - "$MILOCO_HOME" "$ADAPTER_PORT" "$BEARER" <<'PY'
+# 写 agent.platform='hermes'(backend dispatcher 据此走 adapter 路径;
+# 注意 Step 4.8 也写 platform,这里幂等覆盖,防御)
+"$PYTHON" - "$MILOCO_HOME" "hermes" <<'PY' || true
 import json, sys
-home, port, bearer = sys.argv[1], sys.argv[2], sys.argv[3]
+home, platform = sys.argv[1], sys.argv[2]
 p = f"{home}/config.json"
-cfg = json.load(open(p, encoding="utf-8"))
+try:
+    cfg = json.load(open(p, encoding="utf-8"))
+except Exception:
+    cfg = {}
 cfg.setdefault("agent", {})
-cfg["agent"]["webhook_url"] = f"http://127.0.0.1:{port}/miloco/webhook"
-cfg["agent"]["auth_bearer"] = bearer
+cfg["agent"]["platform"] = platform
 json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-print(f"  webhook_url = http://127.0.0.1:{port}/miloco/webhook")
-print(f"  auth_bearer = {bearer[:8]}...")
+print(f"  agent.platform = {platform}")
 PY
 mark_done 5
 
@@ -910,16 +909,28 @@ else
 fi
 mark_done 6
 
-# --- 7. 重启 adapter ---
-# 委托给 scripts/miloco-adapter.sh start，由它根据平台选择路径：
-#   - macOS → launchd LaunchAgent（plist + launchctl load），adapter 完全脱离 install.sh 进程组
-#   - Linux / Git Bash / WSL → nohup + </dev/null + 60s retry loop
-# 这样 install.sh exit 1 时，adapter 不会被 SIGHUP/SIGTERM 误杀（macOS 上是关键）
-step 7 "重启 adapter (端口 ${ADAPTER_PORT})"
-info "  委托给 scripts/miloco-adapter.sh（macOS 走 launchd，其他走 nohup）"
-if ! bash "$HERE/scripts/miloco-adapter.sh" start; then
-  err "adapter 启动失败"
-  exit 1
+# --- 7. (deprecated)原 PR #279 启 adapter ---
+# 【hermes-pr.md §五 #1 完成】不再启动独立 adapter 进程 — 入站改走 backend
+# AgentPlatformAdapter。无 standalone aiohttp server,无 launchd plist。
+# Step 7 保留为空以便脚本流程不被 break;若发现独立 adapter 还在跑(macOS launchd
+# 残留 / Linux 后台进程),记录提示用户手动清理,不再自动拉起。
+step 7 "(deprecated) 检测并提示清理残留 adapter(原 PR #279)"
+if [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
+  if launchctl list 2>/dev/null | grep -q "com.xiaomi.miloco.hermes.adapter"; then
+    warn "  发现 launchd 残留 com.xiaomi.miloco.hermes.adapter(原 PR #279 独立 adapter 进程)"
+    warn "  自动 unload + 删除 plist:"
+    launchctl unload "$HOME/Library/LaunchAgents/com.xiaomi.miloco.hermes.adapter.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.xiaomi.miloco.hermes.adapter.plist"
+    info "  已清理 launchd 残留"
+  fi
+fi
+# 端口 18789 残留进程检查(无 plist 也会残留)
+_stale_pid="$(get_pid_by_port "$ADAPTER_PORT" 2>/dev/null | tr -d ' \r\n' || true)"
+if [ -n "$_stale_pid" ]; then
+  warn "  端口 $ADAPTER_PORT 还被 PID=$_stale_pid 占着(原 adapter 残留)"
+  warn "  自动 kill:"
+  kill_pid "$_stale_pid"
+  info "  已清理"
 fi
 mark_done 7
 
@@ -1045,23 +1056,26 @@ cat <<EOF
 [试一下]
     hermes chat -q "把客厅灯打开" -Q
 
-[adapter 状态]
-    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh status    # 看 PID / 端口
-    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh logs      # tail 日志
-    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh restart   # 重启
-    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh stop      # 停
+[【hermes-pr.md §五 #1 完成】adapter 状态]
+    入站已从独立 aiohttp 进程改为 backend AgentPlatformAdapter 直调。
+    端口 18789 已被弃用,无独立 adapter 进程(Step 7 已自动清理 launchd 残留)。
+    调试入口:
+      bash plugins/hermes/install-hermes.sh --diagnose   # 链路自检
+      curl -sS http://127.0.0.1:1810/health              # backend 健康
+      /Users/wkea/.openclaw/miloco/log/miloco-backend.log  # backend 日志
+      /Users/wkea/.hermes/miloco-adapter.log            # adapter 旧日志(若还有)
 
 [配置文件位置]
-    $MILOCO_HOME/config.json   # miloco 后端配置（已 patch）
+    $MILOCO_HOME/config.json   # miloco 后端配置（已写 agent.platform='hermes'）
     $HERMES_HOME/.env          # Hermes 环境（已追加 API_SERVER_KEY）
     $PLUGIN_STATE              # 插件 deliver.target
-    $ADAPTER_PID               # adapter PID
     $ADAPTER_LOG               # adapter 日志
 
 [想还原]
     ${MILOCO_HOME}/config.json.bak-${TS}  是 patch 前的备份
     $HERMES_HOME/.env 里去掉 API_SERVER_KEY 即可
     卸插件：rm -rf $HERMES_PLUGINS_DIR $HERMES_HOME/skills/miloco-*
+             $MILOCO_HOME/agent_platform/hermes
     disable 插件：hermes plugins disable miloco
 
 [详细文档] $HERE/README.md
