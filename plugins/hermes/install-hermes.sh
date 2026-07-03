@@ -607,38 +607,21 @@ fi
 
 mark_done 1
 
-# --- 1.9 注入 web 静态目录 (cp dist → backend static_dir) ---
-# 为什么: 上游 miloco-cli wheel 自带 main 时期的 web bundle,Hermes fork 改的
-# 前端代码(per-modality perception-toggles 等)永远装不进来。
+# --- 1.9 【hermes-pr.md Zirconi 🟡 修复】web 静态目录注入 ---
+# 当前 fork 未提交 web/dist/(git ls-tree -r HEAD -- web/dist/ 为空),
+# Step 1.9 永远走 elif warn 分支 no-op,误导用户。修法:
+# 选项 A: 二选一(prebuilt 提交进仓库 OR 删 Step)
+# 选项 B: 检测 dist 存在才 cp,不存在直接跳过且不打印误导性信息
+# 本脚本走 B(保守)— dist 不存在就静默 skip + 提示用户具体修复路径。
 #
-# 设计原则（对齐上游 release model）:
-# - 上游走 GitHub Release: build.sh CI 跑一次 + release.yml 上传 prebuilt 归档
-#   + install.py _fetch_release_bundle 下载校验后解压。**用户装的时候不 build**。
-# - fork 没有 release 流水线:用 git 替代 — `web/dist/` 直接 prebuilt 入仓,
-#   install-hermes.sh 从 <fork>/web/dist/ 直接 cp 到 backend static_dir。
-# - **不需要 Node.js / npm / 任何 build 工具**。改 web/ source 的开发者本地
-#   `npm run build` 后 `git add web/dist` 跟代码一起提交即可。
-#
-# 跳过条件: 后端 miloco.config.settings 解析失败(venv 配错),只 warn 不 exit,
-# 此时后端还 serve wheel 自带 bundle(fork 改动不生效但功能不挂)。
-
-step 1.9 "注入 web 静态目录 (cp prebuilt dist → backend static_dir)"
+# 跳过条件: web/dist/ 不存在(开发者本地需 \`npm run build\` 后 \`git add web/dist\` 提交)。
 
 WEB_SRC="$(dirname "$HERE")/../web"   # <fork>/web
 WEB_DIST="$WEB_SRC/dist"
 
-if [ ! -d "$WEB_SRC" ]; then
-  warn "找不到 web 源码目录: $WEB_SRC"
-  warn "(clone 的 repo 结构异常? 跳过前端注入)"
-elif [ ! -d "$WEB_DIST" ]; then
-  warn "找不到 prebuilt web bundle: $WEB_DIST"
-  warn "(开发者本地需 \`npm run build\` 后重跑 install-hermes.sh)"
-else
-  # 找 backend 的 static_dir。
-  # $PYTHON = system python3(大概率不能 import miloco)—— miloco backend
-  # 实际跑在 uv tool venv(由 miloco-cli 管理),需要找到那个 venv 的 python。
-  # 优先探测 uv tool 路径(~/.local/share/uv/tools/miloco/bin/python),
-  # 找不到再用 $PYTHON 拼一把(某些非 uv 装法能用)。
+if [ -d "$WEB_DIST" ]; then
+  step 1.9 "注入 web 静态目录 (cp prebuilt dist → backend static_dir)"
+  # 找 backend 的 static_dir(uv tool venv 优先)
   MILOCO_PY="$PYTHON"
   for _cand in \
     "$HOME/.local/share/uv/tools/miloco/bin/python" \
@@ -658,16 +641,17 @@ except Exception as e:
   if [ -z "$STATIC_DIR" ]; then
     warn "找不到 backend static_dir(import miloco.config.settings 失败)"
     warn "(尝试的 python: $MILOCO_PY)"
-    warn "(venv 配错的话 wheel 自带 bundle 仍生效,fork 改动暂时不挂)"
   else
     info "  STATIC_DIR=$STATIC_DIR"
     cp -r "$WEB_DIST/." "$STATIC_DIR/"
     info "  web/dist/* → \$STATIC_DIR/ ✓"
     warn "提示: web 内容改了,需要重启 backend 让 spa_handler 重解析"
-    warn "      跑 \`hermes gateway restart\` 后 dashboard 才有新 UI"
   fi
+else
+  info "  web/dist/ 未提交 — 跳过 Step 1.9(后端 serve wheel 自带 bundle,功能不挂)"
+  info "  修法(开发者本地):cd web && npm install && npm run build && git add web/dist"
+  # 不调用 step / mark_done 1.9,避免日志里出现'已跳过 step 1.9'的视觉假象
 fi
-mark_done 1.9
 
 # --- 1.10 patch backend(v2 per-modality toggles) ---
 # 为什么: 上游 release 是 v1 schema(CameraToggleItem 只有 did+in_use),
