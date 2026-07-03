@@ -39,9 +39,35 @@ logger = logging.getLogger(__name__)
 
 _HTTP_BUFFER_S = 15.0
 
-# 默认 Hermes api_server 地址(可在构造时 override)
-_DEFAULT_HERMES_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:18100")
-_DEFAULT_API_KEY = os.environ.get("API_SERVER_KEY", "")
+# 默认 Hermes api_server 地址(可在构造时 override + env:HERMES_API_URL)
+# 注意:hermes gateway 主端口默认 8642,不是 18100(18100 是早期 v0.10.0 假设)。
+# install-hermes.sh 不写 HERMES_API_URL(env 由 hermes supervisor 管理),
+# 这里固定默认 8642。
+_DEFAULT_HERMES_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
+
+
+def _load_api_key() -> str:
+    """拿 API_SERVER_KEY:优先级 env > ~/.hermes/.env > 空。
+
+    backend supervisor 一般不会 source ~/.hermes/.env,所以从这里 fallback 读。
+    install-hermes.sh Step 6 已保证 ~/.hermes/.env::API_SERVER_KEY 存在。
+    """
+    key = os.environ.get("API_SERVER_KEY", "").strip()
+    if key:
+        return key
+    env_path = Path.home() / ".hermes" / ".env"
+    if env_path.is_file():
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("API_SERVER_KEY=") and not line.startswith("#"):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return ""
+
+
+_DEFAULT_API_KEY = _load_api_key()
 
 # 上下文溢出关键词(best-effort 识别)。
 # v0.10.0 api_server 无标准化溢出错误码,需按文案匹配。
