@@ -54,31 +54,50 @@ def test_full_includes_catalog_and_capabilities(tmp_miloco_home, monkeypatch):
 
 
 def test_minimal_excludes_catalog_and_capabilities(tmp_miloco_home, monkeypatch):
+    """minimal profile: catalog + capabilities + profile 都不附 → 返回 None(无需注入)。
+
+    071931f 改后,minimal + 无 catalog/prepend 内容为空 → inject_context 返 None。
+    这是预期行为(cron session 没必要在 user message 塞上下文)。
+    """
     monkeypatch.setattr(ci, "get_catalog", lambda: "# devices catalog\nx")
     out = ci.inject_context(session_id="miloco:cron:digest", platform="cron")
-    assert out is not None
-    ctx = out["context"]
-    # minimal 不附工具索引、感知格式、目录
-    assert "## 工具索引(被动清单)" not in ctx
-    assert "# devices catalog" not in ctx
-    # minimal 仍可有感知格式(rule 也要)
-    # 但 minimal 的"感知格式"块也省略(对齐 _build_prepend minimal 分支)
-    assert "voice" not in ctx or "[感知引擎]语音提醒" not in ctx
+    # minimal 不需要注入 → 返 None(对齐 071931f 后语义)
+    assert out is None
 
 
 def test_empty_catalog_omitted(tmp_miloco_home, monkeypatch):
+    """catalog 空但 full profile → prepend 仍有 tools 块 + 感知格式,context 不为 None。
+
+    注:071931f 改后 catalog 空不再附加,但 full profile 仍有其他内容(tools 索引等)。
+    """
     monkeypatch.setattr(ci, "get_catalog", lambda: "")
-    out = ci.inject_context(session_id="agent:main", user_message="hi")
+    out = ci.inject_context(session_id="agent:main:miloco", user_message="hi")
     assert out is not None
     assert "# devices catalog" not in out["context"]
+    assert "## 工具索引(被动清单)" in out["context"]  # full 仍有 tools 块
 
 
-def test_returns_none_when_nothing_to_inject(tmp_miloco_home, monkeypatch):
-    # 071931f 后 identity/capabilities/notify/language 块均已对齐"事实陈述",
-    # 即便 minimal + 无 catalog + 无 profile,prepend 还有数据源 + 感知格式子集
-    # → inject_context 始终非 None。
+def test_returns_none_when_minimal_only(tmp_miloco_home, monkeypatch):
+    """minimal profile 下 prepend + append 都空 → inject_context 返 None。
+
+    071931f 后 minimal 没有任何块需要注入,直接 None,节省 LLM token。
+    """
     out = ci.inject_context(session_id="x", platform="cron")
+    assert out is None
+
+
+def test_full_returns_dict_with_blocks(tmp_miloco_home, monkeypatch):
+    """full profile + 有 catalog → prepend 有 tools 块,append 有 catalog + home_profile。
+
+    防御 071931f 改写后 inject_context 仍返非 None dict(对齐 _build_prepend
+    /_build_append 的契约)。
+    """
+    monkeypatch.setattr(ci, "get_catalog", lambda: "# devices catalog\n灯|客厅")
+    out = ci.inject_context(session_id="agent:main:miloco", user_message="hi")
     assert out is not None
+    assert "context" in out
+    assert "## 工具索引(被动清单)" in out["context"]
+    assert "# devices catalog" in out["context"]
 
 
 # ---------- build_home_profile_block ----------
