@@ -37,6 +37,12 @@ import logging
 # context_injection 模块的 _build_prepend / _build_append / resolve_profile 等
 # 函数仍被 install-hermes.sh Step 4.8 cp 到 $MILOCO_HOME/agent_platform/hermes/
 # 给 HermesAdapter.build_system import。
+#
+# 【hermes-pr.md §五 #3 裁 tool】删 miloco_status / miloco_test_push 自检/调试工具:
+#   - miloco_status: PR #279 时代调试用(诊断 7 项不变量),新架构下 `--diagnose`
+#     自带同等覆盖(plugin 不再独立暴露),避免重复。
+#   - miloco_test_push: 调试用,生产 agent 走 miloco_im_push 即可。
+# 保留 im_push / habit_suggest / notify_bind 3 个 tool。
 from .cron_setup import reconcile_cron_jobs
 from .trace import register_trace_hooks
 from .tools_habit import (
@@ -49,11 +55,7 @@ from .tools_notify import (
 )
 from .tools_status import (
     MILOCO_NOTIFY_BIND_SCHEMA,
-    MILOCO_STATUS_SCHEMA,
-    MILOCO_TEST_PUSH_SCHEMA,
     handle_notify_bind,
-    make_status_handler,
-    make_test_push_handler,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,27 +102,7 @@ def register(ctx) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.exception("注册 miloco_habit_suggest 失败: %s", exc)
 
-    # ── 自检 / 强制推送 / IM 切换(Phase 1: 诊断 + 立即可感) ────────
-    try:
-        ctx.register_tool(
-            name="miloco_status",
-            toolset=TOOLSET,
-            schema=MILOCO_STATUS_SCHEMA,
-            handler=make_status_handler(ctx),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("注册 miloco_status 失败: %s", exc)
-
-    try:
-        ctx.register_tool(
-            name="miloco_test_push",
-            toolset=TOOLSET,
-            schema=MILOCO_TEST_PUSH_SCHEMA,
-            handler=make_test_push_handler(ctx),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("注册 miloco_test_push 失败: %s", exc)
-
+    # ── IM 切换 ──
     try:
         ctx.register_tool(
             name="miloco_notify_bind",
