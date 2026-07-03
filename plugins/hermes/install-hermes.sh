@@ -642,10 +642,15 @@ except Exception:
         info "  miot/$_f ✓"
       fi
     done
-    # config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
+# config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
     if [ -f "$FORK_SRC/config/settings.py" ]; then
       cp "$FORK_SRC/config/settings.py" "$MILOCO_PKG/config/settings.py"
       info "  config/settings.py ✓"
+    fi
+    # observability/agent_meta_poller.py(主线 #11 加了 _poll_once adapter 路径)
+    if [ -f "$FORK_SRC/observability/agent_meta_poller.py" ]; then
+      cp "$FORK_SRC/observability/agent_meta_poller.py" "$MILOCO_PKG/observability/agent_meta_poller.py"
+      info "  observability/agent_meta_poller.py ✓"
     fi
     # perception/collect/camera_adapter.py
     _src="$FORK_SRC/perception/collect/camera_adapter.py"
