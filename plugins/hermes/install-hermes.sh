@@ -503,6 +503,74 @@ fi
 # --- 1.9 【hermes-pr.md §五 #10 MILOCO_HOME 显式配置】 ---
 # doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。
 # 默认 ~/.openclaw/miloco,本步改 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
+#
+# 实现策略:
+# 1. 创建 symlink ~/.hermes/miloco → ~/.openclaw/miloco(避免数据迁移)
+# 2. 写 export MILOCO_HOME=~/.hermes/miloco 到 ~/.zshrc + ~/.bashrc(用户 shell rc)
+#    —— 关键:miloco-cli service start 每次都重新生成 supervisord.conf(用
+#    miloco_home() 的当前值,直接读环境),所以 supervisor conf 写什么不重要,
+#    重要的是 supervisor 进程(macOS 是 launchd 启动的 shell)能拿到 MILOCO_HOME env。
+# 3. 改 supervisord.conf 的 environment(防御性,launchd 父进程若不传 env 时兜底)
+# 4. supervisorctl reread + update(下次 backend 重启继承)
+MILOCO_HOME_HERMES="${HERMES_HOME}/miloco"
+if [ ! -e "$MILOCO_HOME_HERMES" ] && [ -d "$MILOCO_HOME" ]; then
+  info "  创建 symlink: $MILOCO_HOME_HERMES -> $MILOCO_HOME (避免数据迁移)"
+  ln -s "$MILOCO_HOME" "$MILOCO_HOME_HERMES"
+elif [ -d "$MILOCO_HOME_HERMES" ] && [ ! -L "$MILOCO_HOME_HERMES" ]; then
+  warn "  $MILOCO_HOME_HERMES 已是真实目录(非 symlink),不强行覆盖"
+fi
+# 写用户 shell rc(关键路径:macOS supervisor 由 launchd 启动,env 来自 launchd
+# → 父进程 shell → shell rc。如果 shell rc 设了 MILOCO_HOME,supervisor 子进程
+# 继承,生成的 supervisord.conf::environment=MILOCO_HOME 才会用对的值)
+SHELL_RC_LIST=()
+[ -f "$HOME/.zshrc" ] && SHELL_RC_LIST+=("$HOME/.zshrc")
+[ -f "$HOME/.bashrc" ] && SHELL_RC_LIST+=("$HOME/.bashrc")
+if [ ${#SHELL_RC_LIST[@]} -gt 0 ]; then
+  for _rc in "${SHELL_RC_LIST[@]}"; do
+    if grep -q "^export MILOCO_HOME=" "$_rc" 2>/dev/null; then
+      "$PYTHON" - "$_rc" "$MILOCO_HOME_HERMES" <<'PY'
+import re, sys
+rc, new = sys.argv[1], sys.argv[2]
+text = open(rc, encoding='utf-8').read()
+text = re.sub(r'^export MILOCO_HOME=.*$', f'export MILOCO_HOME="{new}"', text, flags=re.MULTILINE)
+open(rc, 'w', encoding='utf-8').write(text)
+PY
+      info "  $_rc: export MILOCO_HOME 已更新"
+    else
+      echo "" >> "$_rc"
+      echo "# miloco Hermes 兼容层(${MILOCO_HOME_HERMES:-默认 ~/.openclaw/miloco})" >> "$_rc"
+      echo "export MILOCO_HOME=\"$MILOCO_HOME_HERMES\"" >> "$_rc"
+      info "  $_rc: export MILOCO_HOME 已追加"
+    fi
+  done
+else
+  warn "  ~/.zshrc / ~/.bashrc 都不存在,无法持久化 MILOCO_HOME"
+  warn "  手动在 shell rc 加: export MILOCO_HOME=\"$MILOCO_HOME_HERMES\""
+fi
+# 改 supervisor conf 把 MILOCO_HOME env 切到 ~/.hermes/miloco
+# (注意 miloco-cli service start 每次会重新生成,这里写只是防御,真生效靠 shell rc)
+SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
+if [ -f "$SUPERVISORD_CONF" ]; then
+  if grep -q 'MILOCO_HOME=' "$SUPERVISORD_CONF"; then
+    "$PYTHON" - "$SUPERVISORD_CONF" "$MILOCO_HOME_HERMES" <<'PY'
+import re, sys
+path, new_home = sys.argv[1], sys.argv[2]
+text = open(path, encoding='utf-8').read()
+text = re.sub(r'MILOCO_HOME="[^"]*"', f'MILOCO_HOME="{new_home}"', text)
+open(path, 'w', encoding='utf-8').write(text)
+print(f"  supervisord.conf::MILOCO_HOME = {new_home} (防御性,被 miloco-cli start 覆盖时由 shell rc 兜底)")
+PY
+  fi
+fi
+# supervisor reread + update(让新 conf 暂存,等下次 restart 应用)
+if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.sock" ]; then
+  supervisorctl -c "$SUPERVISORD_CONF" reread 2>&1 | head -3 || true
+  supervisorctl -c "$SUPERVISORD_CONF" update 2>&1 | head -3 || true
+fi
+
+# --- 1.9 【hermes-pr.md §五 #10 MILOCO_HOME 显式配置】 ---
+# doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。
+# 默认 ~/.openclaw/miloco,本步改 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
 # 实现策略:symlink(避免数据迁移)+ supervisor conf 改 env + plugin paths.py
 # 已读 env(无需改) + backend settings.py 已读 env(无需改)。
 MILOCO_HOME_HERMES="${HERMES_HOME}/miloco"
