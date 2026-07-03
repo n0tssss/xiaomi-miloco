@@ -16,17 +16,24 @@ from __future__ import annotations
 
 from .base import (
     AgentPlatformAdapter,
+    AdapterTransportError,
+    AdapterTransientError,
     AgentTurnResult,
     SystemPromptBuilder,
+    TraceMeta,
     TurnContext,
 )
-from .loader import get_adapter, load_adapter
+from .loader import get_adapter, load_adapter, reset_cache
 
 __all__ = [
     "AgentPlatformAdapter",
+    "AdapterTransportError",
+    "AdapterTransientError",
     "AgentTurnResult",
     "SystemPromptBuilder",
+    "TraceMeta",
     "TurnContext",
     "get_adapter",
     "load_adapter",
+    "reset_cache",
 ]
