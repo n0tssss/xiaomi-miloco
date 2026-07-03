@@ -586,6 +586,38 @@ if [ ! -d "$FORK_SRC/miot" ]; then
   warn "找不到 fork backend 源码: $FORK_SRC"
   warn "(clone 的 repo 不含 backend 目录? 跳过 backend patch)"
 else
+  # 9cacc22 后新增: 探能 import miloco 的 python(uv tool 装的 miloco 不在 system python3 里)
+  # 优先级对齐 Step 1.8: config.json python_bin > uv tool > pyenv > PYTHON(兜底)
+  MILOCO_PY=""
+  if [ -f "$MILOCO_HOME/config.json" ]; then
+    _cfg_py="$("$PYTHON" -c "
+import json
+try:
+    cfg=json.load(open('$MILOCO_HOME/config.json',encoding='utf-8'))
+    print(cfg.get('server',{}).get('python_bin','') or '')
+except Exception:
+    pass
+" 2>/dev/null || true)"
+    if [ -x "$_cfg_py" ] && "$_cfg_py" -c 'import miloco' >/dev/null 2>&1; then
+      MILOCO_PY="$_cfg_py"
+    fi
+  fi
+  if [ -z "$MILOCO_PY" ]; then
+    for cand in \
+      "$HOME/.local/share/uv/tools/miloco/bin/python" \
+      "$HOME/.local/share/uv/tools/miloco/bin/python3" \
+      "$HOME/.venvs/miloco/bin/python" \
+      "$HOME/.venvs/miloco/bin/python3"
+    do
+      if [ -x "$cand" ] && "$cand" -c 'import miloco' >/dev/null 2>&1; then
+        MILOCO_PY="$cand"
+        break
+      fi
+    done
+  fi
+  [ -z "$MILOCO_PY" ] && MILOCO_PY="$PYTHON"
+  info "  MILOCO_PY = $MILOCO_PY"
+
   # 拿 miloco package 安装目录(static_dir 往上 1 级)
   MILOCO_PKG="$("$MILOCO_PY" -c "
 try:
@@ -595,7 +627,7 @@ try:
     print(d)
 except Exception:
     pass
-" 2>/dev/null)"
+" 2>/dev/null || true)"
   if [ -z "$MILOCO_PKG" ] || [ ! -d "$MILOCO_PKG/miot" ]; then
     warn "找不到 miloco package 安装目录(import miloco 失败)"
     warn "(venv 配错,跳过 backend patch)"
