@@ -28,9 +28,7 @@ from miloco.agent_platform.base import (
     TurnContext,
 )
 from miloco.config import get_settings
-from miloco.middleware.exceptions import AgentWebhookException
 from miloco.observability.agent_meta_poller import AgentRunSource, track_agent_run
-from miloco.utils.agent_client import run_agent_turn
 
 logger = logging.getLogger(__name__)
 
@@ -229,37 +227,22 @@ class AgentDispatcher:
         status: str = "error"
         rtt_ms: float = 0.0
 
-        # ----- 优先走 Adapter(hermes-pr.md §五 #1 主线);加载失败 fallback 到 webhook -----
+        # 【hermes-pr.md §五 #1 完成】只走 AgentPlatformAdapter — 原 PR #279 webhook
+        # fallback 链路已删除(独立 adapter 进程删了,webhook 不再有 listener)。
+        # 启动时若 adapter 加载失败 → dispatch_event 的 warn + drop 是预期行为
+        # (运维错误,不是 fallback 路径)。
         adapter = get_adapter()
-        if adapter is not None:
-            run_id, status, rtt_ms = await self._send_via_adapter(
-                adapter, msg, session_key, lane, trace_id, wait_ms, event_type,
+        if adapter is None:
+            logger.warning(
+                "no agent adapter loaded; cannot dispatch session=%s type=%s "
+                "(check config.json::agent.platform + "
+                "$MILOCO_HOME/agent_platform/<name>/adapter.py)",
+                session_key, event_type,
             )
-        else:
-            for attempt in range(self._TRANSPORT_RETRIES + 1):
-                try:
-                    run_id, status, rtt_ms = await run_agent_turn(
-                        msg,
-                        session_key=session_key,
-                        lane=lane,
-                        trace_id=trace_id,
-                        wait_timeout_ms=wait_ms,
-                    )
-                    break
-                except AgentWebhookException as e:
-                    # 传输失败（连接 / 5xx / HTTP 超时）→ 有限短退避重试,
-                    # exhausted 后 WARN、跳过该批，继续下一批。
-                    if attempt == self._TRANSPORT_RETRIES:
-                        logger.warning(
-                            "agent turn transport failed session=%s type=%s err=%s; "
-                            "skipping batch after %d attempts",
-                            session_key,
-                            event_type,
-                            e,
-                            attempt + 1,
-                        )
-                        return
-                    await asyncio.sleep(self._TRANSPORT_BACKOFF_S * (2**attempt))
+            return
+        run_id, status, rtt_ms = await self._send_via_adapter(
+            adapter, msg, session_key, lane, trace_id, wait_ms, event_type,
+        )
 
         if status == "timeout":
             # 超时仅放行后续 turn、不终止平台在途 turn → WARN、跳过本批、继续下一批。
