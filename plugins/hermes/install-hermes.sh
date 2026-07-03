@@ -632,8 +632,9 @@ except Exception:
     warn "找不到 miloco package 安装目录(import miloco 失败)"
     warn "(venv 配错,跳过 backend patch)"
   else
-    # miot/
-    for _f in schema.py router.py service.py filter.py; do
+    # miot/(含 client.py:fork 的 client.py 不 import 上游 filter.py 的
+    # select_active_camera_dids(那个函数在 v2 拆到别处了),cp 进去才能一致)
+    for _f in schema.py router.py service.py filter.py client.py; do
       _src="$FORK_SRC/miot/$_f"
       _dst="$MILOCO_PKG/miot/$_f"
       if [ -f "$_src" ]; then
