@@ -1066,10 +1066,9 @@ cat <<EOF
       /Users/wkea/.hermes/miloco-adapter.log            # adapter 旧日志(若还有)
 
 [配置文件位置]
-    $MILOCO_HOME/config.json   # miloco 后端配置（已写 agent.platform='hermes'）
-    $HERMES_HOME/.env          # Hermes 环境（已追加 API_SERVER_KEY）
-    $PLUGIN_STATE              # 插件 deliver.target
-    $ADAPTER_LOG               # adapter 日志
+$MILOCO_HOME/config.json   # miloco 后端配置（已写 agent.platform='hermes'）
+     $HERMES_HOME/.env          # Hermes 环境（已追加 API_SERVER_KEY）
+     $PLUGIN_STATE              # 插件 deliver.target
 
 [想还原]
     ${MILOCO_HOME}/config.json.bak-${TS}  是 patch 前的备份
