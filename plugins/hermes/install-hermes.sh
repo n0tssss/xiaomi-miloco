@@ -652,6 +652,11 @@ except Exception:
       cp "$FORK_SRC/observability/agent_meta_poller.py" "$MILOCO_PKG/observability/agent_meta_poller.py"
       info "  observability/agent_meta_poller.py ✓"
     fi
+    # dispatch/dispatcher.py(#1 完成 - 去 webhook fallback)
+    if [ -f "$FORK_SRC/dispatch/dispatcher.py" ]; then
+      cp "$FORK_SRC/dispatch/dispatcher.py" "$MILOCO_PKG/dispatch/dispatcher.py"
+      info "  dispatch/dispatcher.py ✓"
+    fi
     # perception/collect/camera_adapter.py
     _src="$FORK_SRC/perception/collect/camera_adapter.py"
     _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
