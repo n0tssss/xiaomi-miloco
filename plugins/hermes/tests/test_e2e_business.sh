@@ -48,9 +48,15 @@ else
   echo "    修法: miloco-cli config set model.omni.api_key '<your-key>'"
 fi
 
-# 检查 Xiaomi 账号
+# 也检查 deliver target(顺手),不在的话多 fail 一个
+DELIVER_TARGET=$("$MILOCO_CLI_BIN" account status 2>/dev/null \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('data',{}).get('is_bound'); print('YES' if v is True else 'NO')" \
+  2>/dev/null || echo "NO")
+[ "$DELIVER_TARGET" = "YES" ] || true  # 已在上面 fail,这里不再 fail
+
+# 检查 Xiaomi 账号(数据嵌套 data.is_bound)
 ACCT_BOUND=$("$MILOCO_CLI_BIN" account status 2>/dev/null \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('is_bound'); print('YES' if v is True else 'NO')" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('data',{}).get('is_bound'); print('YES' if v is True else 'NO')" \
   2>/dev/null || echo "NO")
 if [ "$ACCT_BOUND" = "YES" ]; then
   ok "Xiaomi 账号已绑(is_bound: true)"
