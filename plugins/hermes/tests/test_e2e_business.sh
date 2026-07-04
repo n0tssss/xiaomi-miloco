@@ -76,7 +76,7 @@ sleep 5
 
 AFTER=$(hermes cron list 2>&1 | grep -B1 "Name:.*\[miloco" | grep -oE "\[active\]|\[paused\]" | sort | uniq -c)
 echo "  重启后: $AFTER"
-if echo "$AFTER" | grep -q "4 active\|active 4"; then
+if echo "$AFTER" | grep -qE "[[:space:]]4[[:space:]]\[active\]"; then
   ok "L1 守门激活成功:4 个 cron 都 active"
 else
   fail "L1 守门没激活,需手动 hermes cron resume <id>"
