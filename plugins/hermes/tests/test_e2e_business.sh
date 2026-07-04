@@ -169,13 +169,23 @@ section "7. hermes chat 实际调 skill 走 backend LLM"
 # 简单测:让 hermes 调一个 skill,看是否走 LLM 推理
 HERMES_RESPONSE=$("$HERMES_BIN" chat -q "加载 miloco-devices skill,告诉我设备列表" -Q 2>&1 | tail -5)
 echo "  $HERMES_RESPONSE" | head -3
-echo "$HERMES_RESPONSE" | grep -qE "设备|did" && ok "hermes chat 调 miloco-devices 返设备相关响应" \
-  || fail "hermes chat 调 skill 没返设备响应: $(echo "$HERMES_RESPONSE" | head -1)"
+# 匹配多种设备类(灯/空调/热水壶/网关/did/设备)+ 排除 no_devices
+if echo "$HERMES_RESPONSE" | grep -qE "灯|空调|热水|网关|扫地|音箱|did|设备|无.*设备"; then
+  if echo "$HERMES_RESPONSE" | grep -qE "无设备|没绑.*账号"; then
+    skip "hermes chat 调 miloco-devices 返无设备(没绑账号/没设备)"
+  else
+    ok "hermes chat 调 miloco-devices 返设备相关响应"
+  fi
+else
+  fail "hermes chat 调 skill 没返设备响应: $(echo "$HERMES_RESPONSE" | head -1)"
+fi
 
 # === 8. IM 投递真发(用飞书) ===
-section "8. IM 真发 — miloco_im_push 切飞书 + 真发 + 切回"
+section "8. IM 真发 — miloco_im_push 切飞书 + 真发 + 切回(可能需 60-90s)"
 
 "$HERMES_BIN" chat -q "调miloco_notify_bind action=switch target=feishu:oc_806ed7124bae73745846704be33ae2b3" -Q >/dev/null 2>&1
+echo "  (切到飞书,等新会话建立…)"
+# 飞书新会话首次建立可能 60s+,给足够时间
 PUSH=$("$HERMES_BIN" chat -q "调miloco_im_push发:【pr-hermes 真业务流测试 #$(date +%H%M%S)】model + account 都配好" -Q 2>&1 | tail -5)
 echo "  $PUSH" | head -2
 echo "$PUSH" | grep -qE "已送达|飞书.*ok|✅|搞定.*飞书" && ok "im_push 真发飞书" || fail "im_push 失败"
