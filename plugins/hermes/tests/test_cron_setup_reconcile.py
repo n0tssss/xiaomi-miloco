@@ -47,10 +47,21 @@ class _Recording:
             self.calls.append(("remove", jid))
         return _remove
 
+    def make_resume(self):
+        def _resume(jid):
+            self.calls.append(("resume", jid))
+        return _resume
+
 
 def _stub_import_cron_jobs(rec: _Recording):
-    """返回 lambda，匹配 cron_setup._import_cron_jobs 的 (create, list, update, remove) 返回元组。"""
-    funcs = (rec.make_create(), rec.make_list(), rec.make_update(), rec.make_remove())
+    """返回 lambda,匹配 cron_setup._import_cron_jobs 的 (create, list, update, remove, resume) 元组。"""
+    funcs = (
+        rec.make_create(),
+        rec.make_list(),
+        rec.make_update(),
+        rec.make_remove(),
+        rec.make_resume(),
+    )
     return lambda: funcs
 
 
@@ -182,6 +193,63 @@ def test_reconcile_update_pauses_existing_cron_when_backend_not_ready(monkeypatc
     updates = [c for c in rec.calls if c[0] == "update"]
     assert len(updates) == 1
     assert updates[0][2]["enabled"] is False, "update 应把 enabled 改 False"
+
+
+def test_reconcile_resumes_existing_paused_cron_when_backend_ready(monkeypatch):
+    """【L1 守门补】已有 cron 是 state=paused,backend 配齐 → 调 resume_job 真正激活。
+
+    关键:hermes cron 有独立 state 字段(state=paused / running / scheduled),
+    update_job 只改 enabled 不改 state。所以 enabled=True 但 state=paused 的 job
+    不会真正跑。L1 守门要真激活必须再调 resume_job()。
+    """
+    # 只放一个 paused 的 job,其他 3 个是 scheduled(避免意外 resume 全部)
+    existing = [
+        {"id": "abc-123", "name": "[miloco:home-profile] miloco-perception-digest",
+         "state": "paused"},
+        {"id": "def-456", "name": "[miloco:home-profile] miloco-home-patrol",
+         "state": "scheduled"},
+        {"id": "ghi-789", "name": "[miloco:home-profile] miloco-home-dreaming",
+         "state": "scheduled"},
+        {"id": "jkl-012", "name": "[miloco:home-profile] miloco-habit-suggest",
+         "state": "scheduled"},
+    ]
+    rec = _Recording(existing=existing)
+    monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
+    monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
+    monkeypatch.setattr(cron_setup, "_check_backend_ready", _stub_check_backend_ready(True))
+
+    result = cron_setup.reconcile_cron_jobs()
+
+    updates = [c for c in rec.calls if c[0] == "update"]
+    resumes = [c for c in rec.calls if c[0] == "resume"]
+    assert len(updates) == 4
+    assert all(u[2]["enabled"] is True for u in updates)
+    assert len(resumes) == 1, "只有 1 个 paused → 只有 1 个 resume"
+    assert resumes[0][1] == "abc-123"
+    assert result.get("resumed") == 1
+
+
+def test_reconcile_no_resume_when_not_paused(monkeypatch):
+    """cron state 不是 paused(已是 scheduled/running)→ 不调 resume_job(避免无谓操作)。"""
+    existing = [
+        {"id": "abc-123", "name": "[miloco:home-profile] miloco-perception-digest",
+         "state": "scheduled"},
+        {"id": "def-456", "name": "[miloco:home-profile] miloco-home-patrol",
+         "state": "scheduled"},
+        {"id": "ghi-789", "name": "[miloco:home-profile] miloco-home-dreaming",
+         "state": "scheduled"},
+        {"id": "jkl-012", "name": "[miloco:home-profile] miloco-habit-suggest",
+         "state": "scheduled"},
+    ]
+    rec = _Recording(existing=existing)
+    monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
+    monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
+    monkeypatch.setattr(cron_setup, "_check_backend_ready", _stub_check_backend_ready(True))
+
+    cron_setup.reconcile_cron_jobs()
+
+    resumes = [c for c in rec.calls if c[0] == "resume"]
+    assert len(resumes) == 0, "4 个 scheduled cron 都不需再 resume"
 
 
 def test_reconcile_force_env_overrides_backend_check(monkeypatch, tmp_path):
