@@ -33,10 +33,49 @@ from miloco.dispatch import (
 )
 from miloco.dispatch import dispatcher as disp_mod
 from miloco.dispatch.dispatcher import _QueuedEvent
-from miloco.middleware.exceptions import AgentWebhookException
+from miloco.middleware.exceptions import AgentWebhookException  # legacy alias, kept for test back-compat
+from miloco.agent_platform.base import AdapterTransportError
 
 # 队列上限的唯一真源现为 settings；测试读取它，与 dispatcher._enforce_cap 同源。
 MAX_QUEUE = get_settings().dispatcher.max_queue
+
+
+def _patch_with_turn(monkeypatch, turn):
+    """【hermes-pr.md §五 #1+#1 完成】把旧 `run_agent_turn(msg, ...)` mock 转 mock adapter。
+
+    旧 API: ``async turn(msg, *, session_key, lane, trace_id, wait_timeout_ms)`` → `(run_id, status, rtt_ms)`
+    新 API: ``async adapter.send_turn(ctx)`` → AgentTurnResult
+    关键差异:**不 mock _send_via_adapter**,而是 mock `get_adapter` 返 mock adapter。
+    这样的好处:_send_via_adapter 的 retry 逻辑(AdapterTransportError → 重试)真实跑,
+    `turn` 抛的异常会通过 adapter.send_turn 传播到 _send_via_adapter 的 except 块,
+    模拟真实场景(adapter 报 transport error,dispatcher 重试)。
+
+    不然如果 mock 整个 _send_via_adapter → retry 逻辑也被 mock 走,无法测 dispatcher 的重试。
+    """
+    adapter_send_turn_calls = []
+
+    class _MockAdapter:
+        name = "mock"
+
+        async def send_turn(self, ctx):
+            adapter_send_turn_calls.append(ctx)
+            return await turn(
+                ctx.text,
+                session_key=ctx.session_key,
+                lane=ctx.lane,
+                trace_id=ctx.trace_id,
+                wait_timeout_ms=ctx.wait_timeout_ms,
+            )
+
+        async def read_trace_meta(self, run_id):
+            return None
+
+        def build_system(self, profile, extra):
+            return ""
+
+    mock_adapter = _MockAdapter()
+    monkeypatch.setattr(disp_mod, "get_adapter", lambda: mock_adapter)
+    return mock_adapter, adapter_send_turn_calls
 
 
 def _join(items: list) -> str | None:
@@ -59,25 +98,40 @@ async def _settle(d: AgentDispatcher, timeout: float = 2.0) -> None:
 def patched(monkeypatch):
     """Patch the dispatcher module's collaborators; return a call recorder.
 
-    Default ``run_agent_turn`` is instantaneous and returns an ok status with a
-    monotonically-numbered runId. Tests needing slow/timeout/raising behavior
-    re-``monkeypatch.setattr`` ``disp_mod.run_agent_turn`` themselves.
+    【hermes-pr.md §五 #1+#2+#4+#11+#1 完成】dispatcher 改走 adapter-only(原 run_agent_turn
+    webhook 路径已删)。测试 mock 改用 mock adapter 替换 get_adapter,默认 send_turn
+    立即返 ok(模拟正常调通)。需要 slow/timeout/error 行为的测试自己再
+    monkeypatch.setattr 替换 _send_via_adapter。
     """
     rec = SimpleNamespace(turns=[], tracks=[])
 
-    async def default_turn(msg, *, session_key, lane, trace_id, wait_timeout_ms):
-        rec.turns.append(
-            SimpleNamespace(
-                msg=msg,
-                session_key=session_key,
-                lane=lane,
-                trace_id=trace_id,
-                wait_timeout_ms=wait_timeout_ms,
-            )
-        )
-        return f"run-{len(rec.turns)}", "ok", 1.0
+    class _MockAdapter:
+        name = "mock"
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", default_turn)
+        async def send_turn(self, ctx):
+            rec.turns.append(
+                SimpleNamespace(
+                    msg=ctx.text,
+                    session_key=ctx.session_key,
+                    lane=ctx.lane,
+                    trace_id=ctx.trace_id,
+                    wait_timeout_ms=ctx.wait_timeout_ms,
+                    profile=ctx.profile,
+                    extra=ctx.extra,
+                )
+            )
+            from types import SimpleNamespace as _NS
+            return _NS(run_id=f"run-{len(rec.turns)}", status="ok", rtt_ms=1.0)
+
+        async def read_trace_meta(self, run_id):
+            return None
+
+        def build_system(self, profile, extra):
+            return ""
+
+    mock_adapter = _MockAdapter()
+    # patch get_adapter 返 mock,这样 dispatcher._send_via_adapter 能找到它
+    monkeypatch.setattr(disp_mod, "get_adapter", lambda: mock_adapter)
 
     def fake_track(trace_id, run_id, source, rtt_ms):
         rec.tracks.append(
@@ -87,6 +141,8 @@ def patched(monkeypatch):
         )
 
     monkeypatch.setattr(disp_mod, "track_agent_run", fake_track)
+
+    # get_settings mock:dispatcher._enforce_cap 读 .dispatcher.max_queue
     monkeypatch.setattr(
         disp_mod,
         "get_settings",
@@ -96,6 +152,7 @@ def patched(monkeypatch):
             )
         ),
     )
+
     return rec
 
 
@@ -231,7 +288,7 @@ async def test_same_type_merge_into_one_turn(patched, monkeypatch):
             await gate.wait()  # hold turn-1 so b & c pile up behind it
         return f"run-{n['i']}", "ok", 1.0
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", turn)
+    _patch_with_turn(monkeypatch, turn)
 
     d = AgentDispatcher()
     await d.start()
@@ -277,7 +334,7 @@ async def test_single_flight_per_session(patched, monkeypatch):
         state["inflight"] -= 1
         return "run-x", "ok", 1.0
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", turn)
+    _patch_with_turn(monkeypatch, turn)
 
     d = AgentDispatcher()
     await d.start()
@@ -325,7 +382,7 @@ async def test_missing_run_id_not_tracked(patched, monkeypatch):
     async def turn(msg, *, session_key, lane, trace_id, wait_timeout_ms):
         return None, "ok", 1.0  # ok status but no runId
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", turn)
+    _patch_with_turn(monkeypatch, turn)
 
     d = AgentDispatcher()
     await d.start()
@@ -343,7 +400,7 @@ async def test_timeout_skips_and_does_not_track(patched, monkeypatch):
     async def turn(msg, *, session_key, lane, trace_id, wait_timeout_ms):
         return "run-x", "timeout", 1.0
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", turn)
+    _patch_with_turn(monkeypatch, turn)
 
     d = AgentDispatcher()
     await d.start()
@@ -363,9 +420,9 @@ async def test_transport_exception_retries_then_skips_and_survives(patched, monk
     async def turn(msg, *, session_key, lane, trace_id, wait_timeout_ms):
         nonlocal calls
         calls += 1
-        raise AgentWebhookException("boom")
+        raise AdapterTransportError("boom")  # 【hermes-pr.md §五 #1+#1 完成】新架构用 AdapterTransportError(替代 AgentWebhookException)
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", turn)
+    _patch_with_turn(monkeypatch, turn)
 
     d = AgentDispatcher()
     d._TRANSPORT_BACKOFF_S = 0.0  # neutralize backoff sleeps for a fast test
@@ -448,7 +505,7 @@ async def test_stop_cancels_inflight(patched, monkeypatch):
         await asyncio.sleep(3600)  # park forever; stop() must cancel it
         return "run-x", "ok", 1.0
 
-    monkeypatch.setattr(disp_mod, "run_agent_turn", turn)
+    _patch_with_turn(monkeypatch, turn)
 
     d = AgentDispatcher()
     await d.start()
