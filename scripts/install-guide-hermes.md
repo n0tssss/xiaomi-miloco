@@ -61,7 +61,42 @@ bash plugins/hermes/install-hermes.sh --diagnose
 
 **只跑感知/规则/任务时需要**(纯 chat / im_push 推送 / skill 调试不需要)。
 
-### 米家账号(必需,感知/规则用)
+### 1. Omni 模型(LLM 功能,推荐先配)
+
+**L1 守门**:pr-hermes fork 的 `reconcile_cron_jobs` 会检测 `model.omni.api_key`,配齐后 4 个受管 cron 自动 active。没配齐时 cron 保持 paused(避免每 15min 推 [SILENT] 骚扰)。
+
+Agent 跑三条 `config get` 看已配状态:
+```bash
+miloco-cli config get model.omni.api_key
+miloco-cli config get model.omni.model
+miloco-cli config get model.omni.base_url
+```
+
+**未配置**:发用户下面这段让他选 + 贴值:
+> Miloco 的感知引擎需要一个多模态大模型(Omni Model)来理解摄像头画面。
+> 默认推荐 **小米 MiMo** 模型,任何 OpenAI 兼容服务都行。
+>
+> **A. 默认 MiMo**(key 申请:https://platform.xiaomimimo.com):
+> ```bash
+> miloco-cli config set model.omni.api_key "<key>"
+> ```
+>
+> **B. 第三方多模态**(OpenAI / Anthropic 兼容 / 自建 / vllm / ollama):
+> ```bash
+> miloco-cli config set \
+>   model.omni.api_key "<key>" \
+>   model.omni.base_url "<base_url>" \
+>   model.omni.model "<model>"
+> ```
+
+参考 `backend/.env.example` 看完整 3 provider 示例。
+
+配完后 agent 重启 backend:
+```bash
+miloco-cli service restart
+```
+
+### 2. 米家账号(感知/规则用,模型配好后再做)
 
 Agent 跑:
 ```bash
@@ -76,33 +111,16 @@ miloco-cli account status
   ```
   base64 5 分钟过期,过期就再让用户重新拿一次。
 
-### Omni 模型(必需,LLM 功能用)
+### 3. 设备准备(感知数据来源)
 
-Agent 跑三条 `config get` 看已配状态:
+用 **米家 App** 登录同账号(同 miloco OAuth 那个账号),设备会自动出现在 miloco 后端。验证:
 ```bash
-miloco-cli config get model.omni.api_key
-miloco-cli config get model.omni.model
-miloco-cli config get model.omni.base_url
+miloco-cli device list
 ```
 
-**未配置**:发用户下面这段让他选:
-> Miloco 的感知引擎需要一个多模态大模型(Omni Model)来理解摄像头画面。
-> 默认推荐 **小米 MiMo** 模型。
->
-> **A. 默认 MiMo**:从 https://platform.xiaomimimo.com 拿 key,直接贴我(model = `mimo-v2.5`、base_url = `https://api.xiaomimimo.com/v1` 是默认值,不必设)。
->
-> **B. 第三方多模态**(OpenAI / Anthropic / 自建 / 任何 OpenAI 兼容 API):贴「model 名 / base_url / api_key」三个值。
+## 配齐后的自动行为
 
-用户回选 + 贴值,Agent 跑:
-```bash
-# A
-miloco-cli config set model.omni.api_key "<key>"
-
-# B
-miloco-cli config set model.omni.model "<model>" model.omni.base_url "<base_url>" model.omni.api_key "<key>"
-```
-
-**已配置**:跳过,跑完收工。
+`reconcile_cron_jobs` 跑时检测 backend ready(model.omni.api_key 配齐)→ 4 个受管 cron 自动 update 为 active,无需用户手动 `hermes cron resume`。配置即生效。
 
 ---
 
