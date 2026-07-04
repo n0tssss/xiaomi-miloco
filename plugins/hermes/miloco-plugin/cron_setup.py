@@ -88,8 +88,10 @@ _CRON_TASKS: List[Dict[str, Any]] = [
 def _import_cron_jobs():
     """延迟 import cron.jobs；失败返回 None（graceful）。"""
     try:
-        from cron.jobs import create_job, list_jobs, update_job, remove_job
-        return create_job, list_jobs, update_job, remove_job
+        from cron.jobs import (
+            create_job, list_jobs, update_job, remove_job, resume_job,
+        )
+        return create_job, list_jobs, update_job, remove_job, resume_job
     except Exception as exc:  # noqa: BLE001
         logger.info("cron.jobs 不可用，跳过 miloco 受管 cron reconcile: %s", exc)
         return None
@@ -197,8 +199,8 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
     backend_ready = _check_backend_ready()
     cron_active = backend_ready  # paused when not ready
 
-    create_job, list_jobs, update_job, remove_job = funcs
-    created = updated = removed = 0
+    create_job, list_jobs, update_job, remove_job, resume_job = funcs
+    created = updated = removed = resumed = 0
 
     try:
         existing = list_jobs(include_disabled=True)
@@ -223,6 +225,14 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
                     deliver=deliver_target,
                     enabled=cron_active,  # 【L1 守门】backend 没配齐时创 paused
                 )
+                # 【L1 守门补】如果 backend 配齐 + create 时 enabled=True,需确保 state 是
+                # scheduled(默认是,但显式 resume 一次保险,防 hermes 老版本的 create_job
+                # 默认 state=paused 行为)
+                if cron_active:
+                    try:
+                        resume_job(target_name)
+                    except Exception:
+                        pass
                 created += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning("create_job(%s) 失败: %s", target_name, exc)
@@ -244,6 +254,15 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
                 updated += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning("update_job(%s) 失败: %s", found.get("id"), exc)
+            # 【L1 守门补】hermes cron 有独立 state 字段(state=paused/running/scheduled),
+            # update_job 只改 enabled 不改 state。如果 cron_active=True 但 state=paused
+            # (之前手动 pause 过),需调 resume_job 真正激活。L1 守门才算"端到端可用"。
+            if cron_active and found.get("state") == "paused":
+                try:
+                    resume_job(found["id"])
+                    resumed += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("resume_job(%s) 失败: %s", found.get("id"), exc)
 
     # 清理受管集合里不在期望名单的 job。
     valid_names = {_managed_name(t["name"]) for t in _CRON_TASKS}
@@ -256,15 +275,16 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
                 logger.warning("remove_job(%s) 失败: %s", job.get("id"), exc)
 
     logger.info(
-        "miloco cron reconcile: created=%d updated=%d removed=%d enabled=%s deliver=%s",
-        created, updated, removed, cron_active, deliver_target,
+        "miloco cron reconcile: created=%d updated=%d removed=%d resumed=%d enabled=%s deliver=%s",
+        created, updated, removed, resumed, cron_active, deliver_target,
     )
     return {
         "created": created,
         "updated": updated,
         "removed": removed,
+        "resumed": resumed,  # 报告 L1 守门实际 unpause 数量
         "skipped": False,
-        "active": cron_active,  # 【L1 守门】返回 enabled 状态,install/启动时可监控
+        "active": cron_active,
     }
 
 
