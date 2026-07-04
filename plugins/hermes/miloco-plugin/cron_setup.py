@@ -25,6 +25,8 @@ import 失败要 graceful：Hermes 不在运行环境时 ``cron.jobs`` 模块不
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,13 @@ from .tools_notify import get_deliver_target
 
 # 受管 job 标签：塞进 name 字段前缀，reconcile 据此识别。
 MANAGED_TAG = "[miloco:home-profile]"
+
+# 【L1 守门:hermes-pr.md §五 #12 准备】环境变量 override,1 = 强制把 cron 创为 active
+# (忽略 backend .env 检测,用于压测/调试);0/未设 = 默认行为(检测 .env)。
+# 注意:每次调用 _check_backend_ready() 时读 env(不在 module 顶层固化),
+# 这样测试 monkeypatch.setenv 能影响下一次调用。
+def _is_force_enabled() -> bool:
+    return os.environ.get("MILOCO_FORCE_CRON_ENABLED", "0") == "1"
 
 
 # 4 个受管 cron 任务定义。schedule 是 Hermes ``parse_schedule`` 接受的 cron 表达式。
@@ -86,6 +95,62 @@ def _import_cron_jobs():
         return None
 
 
+def _check_backend_ready() -> bool:
+    """【L1 守门:hermes-pr.md §五 #12 准备】检测 backend .env 是否配齐 omni model key。
+
+    没配齐时返回 False → reconcile_cron_jobs 把 4 个受管 cron 创为 paused 状态,
+    避免向用户推 [SILENT] 消息(每 15min 推一条太骚扰)。
+
+    检测方法: \`miloco-cli config get model.omni.api_key\` — 这是 backend 暴露的
+    稳定接口,与 plugin 配置读取保持一致。
+
+    override 开关: 环境变量 MILOCO_FORCE_CRON_ENABLED=1 跳过此检查(用于压测/调试)。
+    """
+    if _is_force_enabled():
+        logger.info("MILOCO_FORCE_CRON_ENABLED=1 → 跳过 backend .env 检测,4 个 cron 创为 active")
+        return True
+    try:
+        # miloco-cli 不在 PATH 时(罕见,装时必装),降级 True 让 cron 创出来
+        # (下次 plugin register 仍会触发,用户看到 paused 后能诊断)
+        import shutil
+        if not shutil.which("miloco-cli"):
+            logger.warning("miloco-cli 不在 PATH,降级为 backend ready=True")
+            return True
+        proc = subprocess.run(
+            ["miloco-cli", "config", "get", "model.omni.api_key"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "miloco-cli config get 失败 rc=%s,降级 backend ready=True,后续 cron 触发时再诊断",
+                proc.returncode,
+            )
+            return True
+        api_key = (proc.stdout or "").strip()
+        # 输出格式:"api_key" 或空字符串(用户没配)
+        # 用引号存在判断(避免空字符串误判)
+        ready = bool(api_key) and api_key not in ('""', "''")
+        if not ready:
+            logger.warning(
+                "miloco backend .env 未配齐 model.omni.api_key。"
+                "4 个 miloco cron 保持 paused(避免 [SILENT] 消息骚扰)。\n"
+                "  启用方法: \n"
+                "  1. 编辑 ~/.openclaw/miloco/config.json(或 backend/.env) 配 model.omni.api_key\n"
+                "  2. 跑: hermes cron resume aca1af7a0fd2  # miloco-perception-digest\n"
+                "           hermes cron resume 3171cc142767  # miloco-home-patrol\n"
+                "           hermes cron resume f889fb99432f  # miloco-home-dreaming\n"
+                "           hermes cron resume 98ecd7d4d438  # miloco-habit-suggest\n"
+                "  3. 或: export MILOCO_FORCE_CRON_ENABLED=1 强制 active(忽略检测)"
+            )
+        return ready
+    except subprocess.TimeoutExpired:
+        logger.warning("miloco-cli config get 超时(5s),降级 backend ready=True")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("miloco-cli config get 异常(%s),降级 backend ready=True", exc)
+        return True
+
+
 def _managed_name(task_name: str) -> str:
     return f"{MANAGED_TAG} {task_name}"
 
@@ -126,6 +191,12 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
         return {"created": 0, "updated": 0, "removed": 0, "skipped": True,
                 "reason": "no deliver target"}
 
+    # 【L1 守门:hermes-pr.md §五 #12 准备】检测 backend .env 是否配齐 model key。
+    # 没配齐时把 4 个受管 cron 创为 paused(active=False),避免每 15 分钟推一条
+    # [SILENT] 通知骚扰用户(用户需填 .env + 跑 hermes cron resume 激活)。
+    backend_ready = _check_backend_ready()
+    cron_active = backend_ready  # paused when not ready
+
     create_job, list_jobs, update_job, remove_job = funcs
     created = updated = removed = 0
 
@@ -150,6 +221,7 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
                     name=target_name,
                     skills=list(task["skills"]),
                     deliver=deliver_target,
+                    enabled=cron_active,  # 【L1 守门】backend 没配齐时创 paused
                 )
                 created += 1
             except Exception as exc:  # noqa: BLE001
@@ -158,12 +230,14 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
             # update：刷新 schedule / skills / prompt / deliver（name / id 不动）。
             # deliver 来自 state.json::deliver.target（不是字面量 "all"）；
             # 用户想单推可在 Hermes 里手动改 cron job 的 deliver。
+            # 【L1 守门】enabled 同步 backend_ready 状态 — backend 配齐后,plugin register
+            # 触发 reconcile 会把 paused 改成 active,无需用户手动 resume。
             updates = {
                 "schedule": task["schedule"],
                 "skills": list(task["skills"]),
                 "prompt": task["prompt"],
                 "deliver": deliver_target,
-                "enabled": True,
+                "enabled": cron_active,
             }
             try:
                 update_job(found["id"], updates)
@@ -182,10 +256,16 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
                 logger.warning("remove_job(%s) 失败: %s", job.get("id"), exc)
 
     logger.info(
-        "miloco cron reconcile: created=%d updated=%d removed=%d deliver=%s",
-        created, updated, removed, deliver_target,
+        "miloco cron reconcile: created=%d updated=%d removed=%d enabled=%s deliver=%s",
+        created, updated, removed, cron_active, deliver_target,
     )
-    return {"created": created, "updated": updated, "removed": removed, "skipped": False}
+    return {
+        "created": created,
+        "updated": updated,
+        "removed": removed,
+        "skipped": False,
+        "active": cron_active,  # 【L1 守门】返回 enabled 状态,install/启动时可监控
+    }
 
 
 def teardown_cron_jobs() -> int:
