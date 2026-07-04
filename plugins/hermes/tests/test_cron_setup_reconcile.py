@@ -114,3 +114,132 @@ def test_reconcile_skips_with_clear_reason_when_no_deliver_target(monkeypatch):
     assert not creates, "没有 deliver target 时不应该调 create_job"
     assert result.get("skipped") is True
     assert result.get("reason") == "no deliver target"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# 【L1 守门:hermes-pr.md §五 #12 准备】backend .env 没配齐 model key
+# → 4 个受管 cron 创为 paused,避免每 15min 推 [SILENT] 骚扰用户
+# ────────────────────────────────────────────────────────────────────────
+
+
+def _stub_check_backend_ready(ready: bool):
+    """返回 lambda 替换 cron_setup._check_backend_ready。"""
+    return lambda: ready
+
+
+def test_reconcile_creates_crons_paused_when_backend_not_ready(monkeypatch, tmp_path):
+    """backend .env 没配齐 model key → 4 个 cron 都创为 enabled=False(paused)。
+
+    防骚扰:没配 key 时 cron 跑也返 [SILENT],hermes 仍发 Cronjob Response
+    通知,每 15min 推一条太烦。守门:register 时检 backend 配齐才 active,没配齐
+    创 paused(用户填 .env 后下次 plugin register 自动激活,无需手动 resume)。
+    """
+    rec = _Recording(existing=[])
+    monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
+    monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
+    monkeypatch.setattr(cron_setup, "_check_backend_ready", _stub_check_backend_ready(False))
+
+    result = cron_setup.reconcile_cron_jobs()
+
+    creates = [c for c in rec.calls if c[0] == "create"]
+    assert len(creates) == 4, "4 个受管 cron 都应被创建"
+    for c in creates:
+        assert c[1]["enabled"] is False, (
+            f"backend 没配齐时,所有 cron 应创为 paused,实际 enabled={c[1].get('enabled')}"
+        )
+    assert result.get("active") is False
+    assert result.get("skipped") is False  # 不是 skipped,只是 active=False
+
+
+def test_reconcile_creates_crons_active_when_backend_ready(monkeypatch, tmp_path):
+    """backend 配齐 model key → 4 个 cron 创为 enabled=True(正常路径)。"""
+    rec = _Recording(existing=[])
+    monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
+    monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
+    monkeypatch.setattr(cron_setup, "_check_backend_ready", _stub_check_backend_ready(True))
+
+    result = cron_setup.reconcile_cron_jobs()
+
+    creates = [c for c in rec.calls if c[0] == "create"]
+    assert len(creates) == 4
+    for c in creates:
+        assert c[1]["enabled"] is True, "backend 配齐时,所有 cron 应创为 active"
+    assert result.get("active") is True
+
+
+def test_reconcile_update_pauses_existing_cron_when_backend_not_ready(monkeypatch):
+    """已有 cron 是 active,backend 突然没配齐 → update 改 enabled=False(自动 pause)。"""
+    existing = [
+        {"id": "abc-123", "name": "[miloco:home-profile] miloco-perception-digest"},
+    ]
+    rec = _Recording(existing=existing)
+    monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
+    monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
+    monkeypatch.setattr(cron_setup, "_check_backend_ready", _stub_check_backend_ready(False))
+
+    cron_setup.reconcile_cron_jobs()
+
+    updates = [c for c in rec.calls if c[0] == "update"]
+    assert len(updates) == 1
+    assert updates[0][2]["enabled"] is False, "update 应把 enabled 改 False"
+
+
+def test_reconcile_force_env_overrides_backend_check(monkeypatch, tmp_path):
+    """MILOCO_FORCE_CRON_ENABLED=1 → 跳过 .env 检测,创 active cron(用于压测/调试)。
+
+    不能 mock 整个 _check_backend_ready(那会跳过 env 检查),只能 mock 它的
+    依赖(shutil.which / subprocess.run)返空,让 function 自然返 False。
+    然后 setenv MILOCO_FORCE_CRON_ENABLED=1 → _is_force_enabled 返 True → override 生效。
+    """
+    from types import SimpleNamespace
+    def fake_run(*a, **kw):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/miloco-cli")
+    monkeypatch.setattr("subprocess.run", fake_run)  # 自然返空 key → backend NOT ready
+    monkeypatch.setenv("MILOCO_FORCE_CRON_ENABLED", "1")  # 但 env 强制 enabled
+
+    rec = _Recording(existing=[])
+    monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
+    monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
+
+    result = cron_setup.reconcile_cron_jobs()
+
+    creates = [c for c in rec.calls if c[0] == "create"]
+    for c in creates:
+        assert c[1]["enabled"] is True, (
+            "override env 1 应跳过 .env 检测,创 active cron(即便 key 为空)"
+        )
+    assert result.get("active") is True
+
+
+def test_check_backend_ready_detects_empty_key(monkeypatch):
+    """miloco-cli 返空字符串 → backend NOT ready(没配 key)。"""
+    from types import SimpleNamespace
+    def fake_run(*a, **kw):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/miloco-cli")
+    monkeypatch.setattr("subprocess.run", fake_run)
+    # 【hermes-pr.md §五 #12 准备】override 在函数内读,monkeypatch.setenv 生效
+    monkeypatch.delenv("MILOCO_FORCE_CRON_ENABLED", raising=False)
+    ready = cron_setup._check_backend_ready()
+    assert ready is False, "空 key 返 False"
+
+
+def test_check_backend_ready_detects_real_key(monkeypatch):
+    """miloco-cli 返非空 key → backend ready。"""
+    from types import SimpleNamespace
+    def fake_run(*a, **kw):
+        return SimpleNamespace(returncode=0, stdout='"sk-abc123456"', stderr="")
+    monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/miloco-cli")
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.delenv("MILOCO_FORCE_CRON_ENABLED", raising=False)
+    ready = cron_setup._check_backend_ready()
+    assert ready is True, "非空 key 返 True"
+
+
+def test_check_backend_ready_handles_miloco_cli_missing(monkeypatch):
+    """miloco-cli 不在 PATH → 降级 ready=True(让 cron 创出来,后续触发时再诊断)。"""
+    monkeypatch.setattr("shutil.which", lambda x: None)
+    monkeypatch.delenv("MILOCO_FORCE_CRON_ENABLED", raising=False)
+    ready = cron_setup._check_backend_ready()
+    assert ready is True, "miloco-cli 缺失时降级 True"
