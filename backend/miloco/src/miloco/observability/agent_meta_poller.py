@@ -214,7 +214,25 @@ class AgentMetaPoller:
             )
             status = (data or {}).get("status")
             if status == "done":
-                return ("done", data)
+                # 【hermes-pr.md §五 #11 完成】caller 用 getattr 读字段,把 dict
+                # 包成 SimpleNamespace,字段名跟 TraceMeta 对齐(适配两种路径返回值)。
+                # webhook 路径返 camelCase(llmTotalMs / toolCallCount / ...),需转 snake_case
+                # 否则 getattr(meta, "llm_total_ms", 0) 永远返默认值 0.0。
+                from types import SimpleNamespace
+                _C2S = {
+                    "runId": "run_id", "query": "query",
+                    "durationMs": "duration_ms", "llmCallCount": "llm_call_count",
+                    "toolCallCount": "tool_call_count",
+                    "llmTotalMs": "llm_total_ms", "toolTotalMs": "tool_total_ms",
+                    "toolMaxMs": "tool_max_ms", "slowestToolName": "slowest_tool_name",
+                    "errorCount": "error_count", "errorMsg": "error_msg",
+                    "jsonlPath": "jsonl_path",
+                }
+                translated = {_C2S.get(k, k): v for k, v in (data or {}).items()}
+                # TraceMeta 不在 observability.types(在 miloco.agent_platform.base),
+                # 但跨模块 import 会引入循环。用 SimpleNamespace 给 caller getattr 读字段。
+                meta = SimpleNamespace(**translated) if translated else SimpleNamespace()
+                return ("done", meta)
             if status == "unknown":
                 return ("unknown", data)
             return ("in_progress", data)

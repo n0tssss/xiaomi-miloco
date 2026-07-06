@@ -60,6 +60,11 @@ check_map = {
     'miloco_backend': tools_status._check_miloco_backend,
     'skills_installed': tools_status._check_skills_installed,
     'trace_hooks': tools_status._check_trace_hooks,
+    # B2 wrapper 收敛(Zirconi 6/25 review): 加 state_json + versions subcommand,
+    # 这样 UPGRADE.md / install-guide-hermes.md 引用的 `miloco-status.sh versions/state_json`
+    # 才有对应实现可用。
+    'state_json': lambda: tools_status._check_state_json(None),
+    'versions': lambda: tools_status._check_versions(None),
 }
 if subcmd not in check_map:
     print(json.dumps({

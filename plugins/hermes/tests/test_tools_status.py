@@ -398,12 +398,20 @@ def test_notify_bind_handler_unknown_action(tmp_path: Path):
 
 
 def test_plugin_yaml_lists_all_5_tools():
+    """Author #3 收敛后 plugin.yaml 只列 3 个 tool（status/test_push 删了,改外部 wrapper）。
+
+    历史名 test_plugin_yaml_lists_all_5_tools 保留以反映这是从 5 → 3 的迁移测试。
+    """
     from pathlib import Path as P
 
     yaml_path = P(__file__).resolve().parents[1] / "miloco-plugin" / "plugin.yaml"
     text = yaml_path.read_text(encoding="utf-8")
-    for tool in ("miloco_im_push", "miloco_habit_suggest", "miloco_status", "miloco_test_push", "miloco_notify_bind"):
+    # 收敛后 3 个 tool
+    for tool in ("miloco_im_push", "miloco_habit_suggest", "miloco_notify_bind"):
         assert f"- {tool}" in text, f"plugin.yaml 没列 {tool}"
+    # 删除的 2 个不该在 plugin.yaml
+    for removed in ("miloco_status", "miloco_test_push"):
+        assert f"- {removed}" not in text, f"plugin.yaml 不该列 {removed}（已收敛到外部 wrapper）"
 
 
 # ─── Issue 5: adapter_health 用 .status_code 而不是 .status ─────────────

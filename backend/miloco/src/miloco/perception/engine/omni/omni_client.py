@@ -13,11 +13,9 @@ from typing import Any
 import httpx
 
 from miloco.database.token_usage_repo import fire_record
-from miloco.observability.context import get_device_context
-from miloco.observability.omni_log import publish_omni_log
 from miloco.perception.engine.config import OmniConfig
 from miloco.perception.engine.omni.constants import MILOCO_USER_AGENT
-from miloco.perception.engine.providers import OmniProvider, get_provider
+from miloco.perception.snapshot_context import push_omni_trace
 
 logger = logging.getLogger(__name__)
 
@@ -146,30 +144,17 @@ async def call_omni(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    # v3: provider 决定 video/audio block 形态 + 可能的额外 request 字段。
-    # PR1 默认 OpenAI 兼容 provider, request_kwargs 返回 {} 行为不变。
-    # ``declared`` 是 PR3 才接 OmniConfig.provider 字段的 hook；PR1 用 getattr
-    # 容错, 永远 None 走 Layer 2/3 自动检测 (当前 1:1 行为)。
-    provider = get_provider(
-        config.base_url, declared=getattr(config, "declared_provider", None)
-    )
-    messages = _build_messages(payload, provider)
+    messages = _build_messages(payload)
 
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
-        "max_tokens": config.max_completion_tokens,  # user config 直接走
+        "max_tokens": config.max_completion_tokens,
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": False,
-        # caller 设好标准 envelope(上述字段 user config 范畴)。
-        # body.update(provider.request_kwargs(...)) 走的是"额外"字段加法 —
-        # provider 只加模型特定字段(如 MiniMax 的 thinking 块),不替 user 改
-        # max_tokens / temperature / top_p / stream。
+        "thinking": {"type": "disabled"},
     }
-    body.update(
-        provider.request_kwargs(payload, fps=payload.get("video_fps", 3))
-    )
 
     t0 = time.monotonic()
     raw: dict[str, Any] | None = None
@@ -201,45 +186,47 @@ async def call_omni(
             f"call_omni failed: {e.__class__.__name__}: {e}", original=e
         ) from e
     finally:
-        _publish_omni_log_safe(
-            messages=messages,
-            raw=raw,
+        push_omni_trace(
+            request_messages=messages,
+            response_raw=raw,
             latency_ms=(time.monotonic() - t0) * 1000,
             error=error,
             model=config.model,
+            inference_params={
+                "temperature": config.temperature,
+                "top_p": config.top_p,
+                "max_tokens": config.max_completion_tokens,
+            },
         )
 
 
-def _build_messages(payload: dict, provider: OmniProvider, sample_rate: int = 16000) -> list[dict]:
-    """构造 messages。
-
-    v3 修订: video/audio block 形态由 provider 决定(替代原来 hardcode 的
-    video_url / input_audio 形态)。
-    """
+def _build_messages(payload: dict) -> list[dict]:
     messages: list[dict] = [{"role": "system", "content": payload["system_prompt"]}]
 
     content: list[dict] = [{"type": "text", "text": payload["user_content"]}]
 
     # Video (frames + audio merged into mp4)；与 audio_base64 互斥（上游 _build_payload 保证）
     if payload.get("video_base64"):
-        video_block = provider.video_block(
-            video_b64=payload["video_base64"],
-            fps=payload.get("video_fps", 3),
-            # PR1: OpenAI 兼容 provider 不 merge audio, audio_b64=None。
-            # PR2 (MiniMax): 这里会传 audio_b64, provider 用 ffmpeg mux。
-            audio_b64=None,
-            audio_sample_rate=sample_rate,
+        content.append(
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": f"data:video/mp4;base64,{payload['video_base64']}"
+                },
+                "fps": payload.get("video_fps", 3),
+                "media_resolution": "max",
+            }
         )
-        if video_block is not None:
-            content.append(video_block)
-    # Audio-only route：独立 audio 块（仅当无 video_base64 时启用）
+    # Audio-only route：独立 input_audio 块（仅当无 video_base64 时启用）
     elif payload.get("audio_base64"):
-        audio_block = provider.audio_block(
-            audio_b64=payload["audio_base64"],
-            sample_rate=sample_rate,
+        content.append(
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": f"data:audio/m4a;base64,{payload['audio_base64']}"
+                },
+            }
         )
-        if audio_block is not None:
-            content.append(audio_block)
 
     # Crop images (from tracker)
     for crop in payload.get("crops", []):
@@ -277,46 +264,6 @@ def extract_usage(raw_response: dict) -> dict[str, int]:
     }
 
 
-def _publish_omni_log_safe(
-    *,
-    messages: list[dict[str, Any]],
-    raw: dict[str, Any] | None,
-    latency_ms: float,
-    error: dict[str, Any] | None,
-    model: str,
-    response_text: str | None = None,
-) -> None:
-    """从 ContextVar 取 device meta,调 publish_omni_log(debug off 时内部自然 no-op)。"""
-    ctx = get_device_context()
-    if ctx is None:
-        return
-    if response_text is None:
-        response_text = ""
-        if raw is not None:
-            try:
-                choices = raw.get("choices") or []
-                if choices:
-                    msg = choices[0].get("message") or {}
-                    response_text = str(msg.get("content") or "")
-            except Exception:
-                response_text = ""
-    usage = extract_usage(raw) if raw is not None else {}
-    try:
-        publish_omni_log(
-            device_trace_id=ctx.device_trace_id,
-            device_id=ctx.device_id,
-            room_name=ctx.room_name,
-            messages=messages,
-            response=response_text,
-            usage=usage,
-            latency_ms=latency_ms,
-            error=error,
-            model=model,
-        )
-    except Exception:
-        logger.exception("publish_omni_log failed")
-
-
 async def call_omni_stream(
     payload: dict,
     config: OmniConfig,
@@ -336,30 +283,18 @@ async def call_omni_stream(
             f"{_ENV_KEY} is not set. Provide it via config or environment variable."
         )
 
-    # v3: provider 决定 video/audio block 形态 + 可能的额外 request 字段。
-    # PR1 默认 OpenAI 兼容 provider, request_kwargs 返回 {} 行为不变。
-    # ``declared`` 是 PR3 才接 OmniConfig.provider 字段的 hook；PR1 用 getattr
-    # 容错, 永远 None 走 Layer 2/3 自动检测 (当前 1:1 行为)。
-    provider = get_provider(
-        config.base_url, declared=getattr(config, "declared_provider", None)
-    )
-    messages = _build_messages(payload, provider)
+    messages = _build_messages(payload)
 
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
-        "max_tokens": config.max_completion_tokens,  # user config 直接走
+        "max_tokens": config.max_completion_tokens,
         "temperature": config.temperature,
         "top_p": config.top_p,
         "stream": True,
         "stream_options": {"include_usage": True},
-        # caller 设好标准 envelope(streaming 路径多 stream_options,这是 OpenAI
-        # 协议的 streaming metadata,不属于 provider 自行加的范畴)。
-        # provider 仍按 body.update(request_kwargs(...)) 走,只加 extras。
+        "thinking": {"type": "disabled"},
     }
-    body.update(
-        provider.request_kwargs(payload, fps=payload.get("video_fps", 3))
-    )
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -427,12 +362,23 @@ async def call_omni_stream(
         # generator close (正常 / 异常 / 消费方提前 break) 时统一上报一次
         if raw_usage_seen is not None:
             fire_record(config.model, raw_usage_seen, type)
-        raw_for_log = {"usage": raw_usage_seen} if raw_usage_seen else None
-        _publish_omni_log_safe(
-            messages=messages,
-            raw=raw_for_log,
+        # stream 路径没有原生 raw response,只能用累积的 chunks + usage 拼一份伪 raw
+        # 让 push_omni_trace 用同一 _pick_response_fields 路径抽 content/usage.
+        # error 路径 raw_for_trace 仍传 (拼出 content="" usage={}),让 trace 行包含
+        # error 字段而不是被丢弃.
+        raw_for_trace: dict[str, Any] = {
+            "choices": [{"message": {"content": "".join(response_chunks)}}],
+            "usage": raw_usage_seen or {},
+        }
+        push_omni_trace(
+            request_messages=messages,
+            response_raw=raw_for_trace,
             latency_ms=(time.monotonic() - t0) * 1000,
             error=error,
             model=config.model,
-            response_text="".join(response_chunks),
+            inference_params={
+                "temperature": config.temperature,
+                "top_p": config.top_p,
+                "max_tokens": config.max_completion_tokens,
+            },
         )

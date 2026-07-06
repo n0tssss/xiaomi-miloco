@@ -12,13 +12,13 @@ miloco 通过 `plugins/hermes/` 接入 Hermes，作为 OpenClaw 之外的并列 
 
 ### 扩展点映射
 
-| miloco 需求                  | Hermes 机制                                                                    | 文件                                 |
-| ---------------------------- | ------------------------------------------------------------------------------ | ------------------------------------ |
-| 16 个 skill                  | `~/.hermes/skills/`（agentskills.io 标准，miloco skill 已合规）                | `scripts/sync-skills.py`             |
-| 注入设备目录/家庭档案/身份块 | `pre_llm_call` 插件钩子，返回 `{"context": text}`                              | `miloco-plugin/context_injection.py` |
-| 注册 tool（通知/习惯建议）   | `ctx.register_tool(name, toolset, schema, handler)`                            | `miloco-plugin/tools_*.py`           |
-| 4 个受管 cron                | `cron.jobs.create_job(prompt, schedule, skills=[...])` + reconcile             | `miloco-plugin/cron_setup.py`        |
-| 后端→agent 同步回调          | api_server `POST /v1/chat/completions`（同步，`X-Hermes-Session-Id` 会话连续） | `adapter/hermes_client.py`           |
+| miloco 需求                  | Hermes 机制                                                                    | 文件                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| 16 个 skill                  | `~/.hermes/skills/`（agentskills.io 标准，miloco skill 已合规）                | `scripts/sync-skills.py`                                 |
+| 注入设备目录/家庭档案/身份块 | `pre_llm_call` 插件钩子，返回 `{"context": text}`                              | `miloco-plugin/context_injection.py`                     |
+| 注册 tool（通知/习惯建议）   | `ctx.register_tool(name, toolset, schema, handler)`                            | `miloco-plugin/tools_*.py`                               |
+| 4 个受管 cron                | `cron.jobs.create_job(prompt, schedule, skills=[...])` + reconcile             | `miloco-plugin/cron_setup.py`                            |
+| 后端→agent 同步回调          | api_server `POST /v1/chat/completions`（同步，`X-Hermes-Session-Id` 会话连续） | `plugins/hermes/miloco-plugin/hermes_adapter/adapter.py` |
 
 ### 关键契约
 
@@ -47,8 +47,7 @@ miloco 通过 `plugins/hermes/` 接入 Hermes，作为 OpenClaw 之外的并列 
 **cron**（`cron/jobs.py::create_job`）：
 
 - `create_job(prompt, schedule, name=None, skills=None, deliver=None, ...)`。
-- `deliver` 必须是 Hermes `Platform` enum 合法值（`"telegram"`/`"feishu"`/`"weixin"`/`"discord"`/`"dingtalk"`/`"slack"`/`"email"`/`"whatsapp-cloud"` 等）；**禁止** `"all"` 或 `"none"` — `Platform("all")` / `Platform("none")` 不是合法 enum,会被 `DeliveryTarget.parse` 静默回退到 `Platform.LOCAL`,所有 cron 输出落到本地 markdown 而非 IM 推送(2026-07 修过的 critical bug 回归风险)。
-- **miloco 受管任务用 `state.json::deliver.target` 动态读取**(PR #279 早期版本硬编码 `"all"` 导致 bug,后改读 state.json);target 空时整个 reconcile 跳过,不传 `"none"` 兜底。
+- `deliver` 是 **Platform enum 字符串**（`"telegram"/"feishu"/"weixin"/"discord"/...`）；miloco 受管任务由 `install-hermes.sh` 从 `~/.hermes/{auth.json,config.yaml}` 探测 IM 平台，写到 `state.json::deliver.target`，`reconcile_cron_jobs` 启动时动态读。**不能用字面量** `"all"/"none"` —— `Platform._missing_()` 拒绝未知值，会 fallback 到 `Platform.LOCAL`，结果写本地 markdown 不推 IM（PR #279 critical bug 根因）。
 - 无 `description` 字段，故把 `[miloco:home-profile]` 标签塞进 `name` 前缀作 reconcile 识别键。
 
 ### 版本兼容约束
@@ -61,7 +60,7 @@ miloco 通过 `plugins/hermes/` 接入 Hermes，作为 OpenClaw 之外的并列 
 
 ### 与后端的通信契约
 
-后端 `run_agent_turn`（`utils/agent_client.py`）向适配进程 `POST {action, payload}`，适配进程翻译为 Hermes `/chat`，同步返回 `{code, message, data}`，`data = {runId, status, error?, recovered?}`，`status ∈ {ok, error, timeout}`。参数与返回值定义见 `adapter/hermes_client.py` 与 `plugins/openclaw/src/webhooks/agent.ts`（OpenClaw 版的契约蓝本）。
+后端 `run_agent_turn`（`utils/agent_client.py`）向适配进程 `POST {action, payload}`，适配进程翻译为 Hermes `/chat`，同步返回 `{code, message, data}`，`data = {runId, status, error?, recovered?}`，`status ∈ {ok, error, timeout}`。参数与返回值定义见 `plugins/hermes/miloco-plugin/hermes_adapter/adapter.py`（HermesAgentAdapter 端）。
 
 ### 出问题找谁
 

@@ -21,7 +21,9 @@ metadata:
 4. 执行结果（可同时触发多项）：
    - 需要操作设备 → 加载 miloco-devices skill，按其流程查 did 并控制（定时任务不预注入设备目录）
    - 需要提醒用户 → 加载并按照 miloco-notify skill 中的流程进行提醒
-   - 都不需要 → 直接结束，不输出任何内容
+   - 都不需要 → **输出单独一行 `NO_REPLY` 作为最后响应**(hermes cron 识别为静默,跳过 IM 推送)
+
+   ⚠️ **不要输出 `[SILENT` (漏右括号) / `silent` / `无内容` 之类的变体** —— hermes cron 只识别精确的 4 个 token:`[SILENT]` / `SILENT` / `NO_REPLY` / `NO REPLY`。其他形式会被当真实内容推到飞书/微信,造成噪音。
 
 ## 职责一：自动操作设备
 

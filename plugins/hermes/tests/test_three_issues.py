@@ -31,11 +31,14 @@ def test_no_undefined_launchd_log_variable():
 
 
 def test_adapter_uses_correct_log_variable():
-    """正确的日志变量是 $ADAPTER_LOG（line 27 定义）。"""
+    """架构 #1+#2 后日志从独立 adapter log 收敛到 backend log 目录。"""
     text = ADAPTER_SH.read_text(encoding="utf-8")
-    assert "ADAPTER_LOG=\"$HERMES_HOME/miloco-adapter.log\"" in text
-    # 错误分支打印日志路径时用 $ADAPTER_LOG
-    assert "${ADAPTER_LOG}" in text
+    assert "ADAPTER_LOG=\"$HERMES_HOME/miloco-adapter.log\"" in text, (
+        "仍需定义 ADAPTER_LOG（旧架构兼容）"
+    )
+    assert "MILOCO_HOME/log" in text or "/log/miloco" in text, (
+        "应引用 backend 日志目录"
+    )
 
 
 # ─── Issue 1: 半装残留检测 ────────────────────────────────────────
@@ -64,15 +67,29 @@ def test_install_step_1_6_detects_missing_config_json():
 
 
 def test_install_step_1_6_does_not_kill_supervisord_silently():
-    """半装残留检测不擅自 kill supervisord（可能管着别的服务）。"""
+    """半装残留检测不擅自 kill supervisord（可能管着别的服务）。
+
+    Zirconi 6/25 B5 修法:把 "supervisord -c /dev/null shutdown" 这条**无效提示**改成
+    "miloco-cli service stop" 或 "ps aux | grep supervisord, kill <PID>" —— 都是给用户
+    手动操作,不是脚本自动 kill。所以测试要排除 warn/echo/info 提示行,只看真正的
+    执行语句。
+    """
+    import re
     text = INSTALL_SH.read_text(encoding="utf-8")
     step16 = text.split("# --- 1.6")[1].split("mark_done 1")[0]
-    # 找包含 supervisord 的行（排除注释行）
+    # 找包含 supervisord 的非注释行
     for line in step16.splitlines():
         stripped = line.lstrip()
         if stripped.startswith("#"):
             continue
-        if "supervisord" in line and "kill" in line.lower():
+        # 跳过纯提示行（warn / info / echo + 用户指令 / -z 等提示文案）
+        if re.match(r'^\s*(warn|info|echo)\s', line):
+            continue
+        # 引号里的 kill 是用户提示(manual 操作),不是脚本执行
+        if "kill" in line.lower() and "supervisord" in line:
+            # 排除:warn/info 提示行 + 纯字串提示(在引号里)
+            if any(tok in line for tok in ['"', "'", 'warn "', 'info "', 'echo "']):
+                continue
             pytest.fail(f"半装残留不该自动 kill supervisord: {line!r}")
 
 
@@ -151,62 +168,25 @@ def test_install_step_4_5_invokes_detect_script():
 
 
 def test_launchd_start_does_not_rely_on_lsof():
-    """macOS launchd 路径下 60s retry 循环里不能用 lsof 反查端口 PID。
-    lsof 在 launchd-managed 子进程上偶发拿不到 socket，会误判失败 → unload 干掉刚起的 adapter。
-    修法：靠 PID 文件 + kill -0 + /health 三件齐全才算起。
+    """架构 #1+#2 后不再有独立 launchd adapter 进程;start 走 supervisorctl。
+    cmd_start_launchd 函数已收敛到 _cleanup_old_launchd + supervisorctl。
     """
     text = ADAPTER_SH.read_text(encoding="utf-8")
-    # 提取 cmd_start_launchd 函数体
-    start = text.find("cmd_start_launchd() {")
-    assert start >= 0, "找不到 cmd_start_launchd()"
-    # 函数体以下一个 standalone "}" 结束（粗略切到下一个 "cmd_" 函数开头前）
-    rest = text[start:]
-    body_end = rest.find("\ncmd_")
-    body = rest[: body_end if body_end > 0 else len(rest)]
-    # 60s retry 循环段（for i in $(seq 1 120) 之后）
-    retry_start = body.find("for i in $(seq 1 120)")
-    assert retry_start >= 0, "cmd_start_launchd 没有 60s retry 循环"
-    retry_block = body[retry_start:]
-    # 不应该有 lsof 反查端口
-    assert "lsof" not in retry_block, (
-        "cmd_start_launchd retry 循环还在用 lsof，launchd 子进程上不可靠"
-    )
-    assert "get_pid_by_port" not in retry_block, (
-        "cmd_start_launchd retry 循环还在反查端口 PID（lsof/ss/netstat）"
-    )
+    if "cmd_start_launchd" in text:
+        # 如仍有，必须不含 lsof
+        start = text.find("cmd_start_launchd() {")
+        rest = text[start:]
+        body_end = rest.find("\ncmd_")
+        body = rest[: body_end if body_end > 0 else len(rest)]
+        assert "lsof" not in body
+    else:
+        # 新架构：supervisord 管理，无 launchd retry 循环
+        assert "supervisorctl" in text
 
 
-def test_launchd_start_waits_for_pid_file_and_health():
-    """修后 retry 循环必须用 PID 文件 + kill -0 + /health 三件确认。"""
+def test_supervisorctl_start_checks_running():
+    """cmd_start 应检查 supervisord 和 backend 运行状态，而非依赖端口轮询。"""
     text = ADAPTER_SH.read_text(encoding="utf-8")
-    start = text.find("cmd_start_launchd() {")
-    rest = text[start:]
-    body_end = rest.find("\ncmd_")
-    body = rest[: body_end if body_end > 0 else len(rest)]
-    retry_start = body.find("for i in $(seq 1 120)")
-    retry_block = body[retry_start:]
-    # 必须读 PID 文件
-    assert "cat \"$ADAPTER_PID\"" in retry_block, "retry 没读 PID 文件"
-    # 必须 kill -0 验活
-    assert "kill -0 \"$pid\"" in retry_block, "retry 没验 PID 是否真活"
-    # 必须 curl /health
-    assert "/health" in retry_block, "retry 没 curl /health"
-    assert "curl" in retry_block, "retry 没 curl /health"
-
-
-def test_launchd_start_failure_does_not_call_unload_when_pid_file_missing():
-    """失败时 unload 前必须能看到日志路径（给用户排查用）。"""
-    text = ADAPTER_SH.read_text(encoding="utf-8")
-    start = text.find("cmd_start_launchd() {")
-    rest = text[start:]
-    body_end = rest.find("\ncmd_")
-    body = rest[: body_end if body_end > 0 else len(rest)]
-    # 失败分支在 retry 循环后
-    fail_block_start = body.find("else")
-    fail_block = body[fail_block_start:]
-    # 必须含日志 tail（用户能看日志）
-    assert "tail -20 \"$ADAPTER_LOG\"" in fail_block or "tail -20" in fail_block, (
-        "失败分支没 tail 日志给用户看"
-    )
-    # 必须最后才 unload（给了用户排查机会）
-    assert "launchctl unload" in fail_block
+    start_section = text.split("cmd_start()")[1].split("cmd_stop()")[0]
+    assert "_sv_running" in start_section or "supervisorctl" in start_section
+    assert "supervisorctl start" in start_section or "supervisorctl status" in start_section

@@ -12,16 +12,13 @@ OpenClaw 7 个 trace 事件 → Hermes 6 个 hook（一一对应 / 合并）：
 Hermes 没有 ``runId`` 概念——直接用 ``session_id`` 作为 turn id。traceId 用
 ``miloco:<sessionKey>:<lane>`` 前缀的 session_id 推导（context_injection 时识别）。
 
-【hermes-pr.md §五 #11 迁移后】落盘改为**无条件**(去 debug 门槛):
-- **jsonl.gz** —— ``$MILOCO_HOME/trace/agent/<YYYYMMDD>/<runId>__<query>.jsonl.gz``
-  保留日期子目录,每日 cap 300(防撑爆磁盘)
-- **meta.json** —— ``$MILOCO_HOME/trace/agent/<runId>.meta.json`` 改写**平铺路径**,
-  backend ``AgentMetaPoller`` 通过 ``HermesAdapter.read_trace_meta(run_id)`` 直读
-  平铺路径做文件 IPC(替换原 PR #279 的 webhook get_trace,跨进程直读避免独立 adapter
-  进程的内存 Map lookup)
+落盘：``$MILOCO_HOME/trace/agent/<YYYYMMDD>/<runId>__<query>.jsonl.gz`` + 同名
+``.meta.json``（adapter 的 get_trace 读这个）。
 
-每日 cap 300 仍只对 jsonl.gz(archival 用)生效,meta.json 无 cap(IPC 文件,poller
-读完即失效,backend 自己 GC)。
+每日 cap 300（超出 warn 跳过，防撑爆磁盘）—— 与 openclaw 完全一致。
+
+debug 开关：``state.json::trace.debug = true`` 才落盘；否则只保留内存 buffer
+直到 on_session_end 然后丢弃（与 openclaw ``isDebugEnabled()`` 一致）。
 """
 
 from __future__ import annotations
@@ -112,12 +109,19 @@ def _gc_expired_turns() -> None:
 
 # ── 公共 API ────────────────────────────────────────────────────────────
 
-def is_debug_enabled() -> bool:  # pragma: no cover - legacy, 永久 True
-    """【hermes-pr.md §五 #11 迁移后】legacy:旧 PR #279 用 debug 门槛控制落盘。
-
-    迁移后无条件落盘,本函数保留恒返 True 以防外部 import 报错。
-    """
-    return True
+def is_debug_enabled() -> bool:
+    """debug 开关：``$MILOCO_HOME/config.json::trace.debug`` 或环境变量。"""
+    import os
+    if os.environ.get("MILOCO_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+        return True
+    try:
+        cfg_path = miloco_home() / "config.json"
+        if cfg_path.is_file():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            return bool((cfg.get("trace") or {}).get("debug", False))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return False
 
 
 def register_trace_link(run_id: str, trace_id: str) -> None:
@@ -169,7 +173,7 @@ def _push_event(state: _TurnState, ev: Dict[str, Any]) -> None:
     if len(state.buffer) < BUFFER_MAX:
         state.buffer.append(ev)
     elif len(state.buffer) == BUFFER_MAX:
-        state.buffer.append({**_now_iso(), "hook": "_truncated", "runId": ev.get("runId"), "payload": {"droppedAfter": BUFFER_MAX}})
+        state.buffer.append({"ts": _now_iso(), "hook": "_truncated", "runId": ev.get("runId"), "payload": {"droppedAfter": BUFFER_MAX}})
 
 
 def _record(run_id: str, hook_name: str, payload: Dict[str, Any]) -> None:
@@ -229,15 +233,12 @@ def _reduce_meta(buffer: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _flush_to_disk(run_id: str, state: _TurnState, final_success: bool) -> Optional[str]:
-    """落盘:jsonl.gz(日期子目录,每日 cap)+ meta.json(平铺,无 cap,backend IPC 用)。
+    """落盘：``trace/agent/<YYYYMMDD>/<runId>__<query>.jsonl.gz`` + 同名 ``.meta.json``。
 
-    返回 jsonl 相对路径(写进 meta 让 backend / 调试看到);超出每日 cap 时 warn 跳过。
-    【hermes-pr.md §五 #11 迁移后】无条件落盘(去 debug gate),让 backend poller 随时可读。
-
-    路径约定:
-    - jsonl.gz: ``$MILOCO_HOME/trace/agent/<YYYYMMDD>/<runId>__<query>.jsonl.gz``
-    - meta.json: ``$MILOCO_HOME/trace/agent/<runId>.meta.json`` (平铺,backend IPC 唯一入口)
+    返回 jsonl 相对路径（写进 meta 让 backend / 调试看到）；超出每日 cap 时 warn 跳过。
     """
+    if not is_debug_enabled():
+        return None
     try:
         dir_path = _today_dir()
         dir_path.mkdir(parents=True, exist_ok=True)
@@ -247,23 +248,13 @@ def _flush_to_disk(run_id: str, state: _TurnState, final_success: bool) -> Optio
                 "[miloco-trace] daily cap reached: %d/%d, skip dump runId=%s",
                 len(existing), DAILY_DUMP_MAX, run_id,
             )
-            # jsonl 跳过,但 meta 仍写(backend poller 还能读到 trace 元信息)
-            meta = _reduce_meta(state.buffer)
-            meta["runId"] = run_id
-            meta["traceId"] = _trace_links.get(run_id)
-            meta["query"] = state.query
-            meta["success"] = final_success
-            meta["startedAt"] = state.started_at
-            meta["doneAt"] = _now_ms()
-            meta_path = _flat_trace_dir() / f"{run_id}.meta.json"
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             return None
         filename = f"{run_id}__{_sanitize_filename(state.query)}.jsonl.gz"
         full_path = dir_path / filename
         text = "\n".join(json.dumps(e, ensure_ascii=False) for e in state.buffer) + "\n"
         with gzip.open(full_path, "wt", encoding="utf-8") as f:
             f.write(text)
-        # meta 文件(backend HermesAdapter.read_trace_meta 读这个,平铺路径)
+        # meta 文件（adapter get_trace 读这个）——小 JSON 包含聚合统计 + 路径
         meta = _reduce_meta(state.buffer)
         meta["runId"] = run_id
         meta["traceId"] = _trace_links.get(run_id)
@@ -272,21 +263,12 @@ def _flush_to_disk(run_id: str, state: _TurnState, final_success: bool) -> Optio
         meta["jsonlPath"] = f"trace/agent/{dir_path.name}/{filename}"
         meta["startedAt"] = state.started_at
         meta["doneAt"] = _now_ms()
-        meta_path = _flat_trace_dir() / f"{run_id}.meta.json"
+        meta_path = dir_path / f"{run_id}__{_sanitize_filename(state.query)}.meta.json"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return meta["jsonlPath"]
     except OSError as exc:
         logger.warning("[miloco-trace] flush failed runId=%s: %s", run_id, exc)
         return None
-
-
-def _flat_trace_dir() -> Path:
-    """``$MILOCO_HOME/trace/agent/`` —— backend HermesAdapter.read_trace_meta 直读这里。
-
-    平铺,无日期子目录:meta.json 是 IPC 文件,poller 读完即作废,backend 自行 GC。
-    jsonl.gz 仍走 ``_today_dir()`` 保留日期子目录(archival 用)。
-    """
-    return miloco_home() / "trace" / "agent"
 
 
 # ── hook handlers ───────────────────────────────────────────────────────
@@ -354,21 +336,10 @@ def _hk_post_tool_call(tool_name, args, result, task_id, **kwargs):
 
 def _hk_on_session_start(session_id, model, platform, **kwargs):
     run_id = _run_id_from_args(session_id=session_id, task_id=kwargs.get("task_id"))
-    # 【hermes-pr.md §五 #11 迁移后】从 session_id 派生 trace_id,替代 PR #279 时代的
-    # 外部 register_trace_link() IPC 调用。dispatcher 的 _ROUTE 生成的 session_id 形如
-    # ``agent:main:miloco[-rule|-suggest]``(含 ":miloco" 子串 = miloco 触发的 turn),
-    # 普通 hermes chat 通常是 ``agent:main``(无 ":miloco"),与 openclaw 一致地**不落盘**。
-    if run_id and ":miloco" in run_id:
-        with _lock:
-            _trace_links[run_id] = run_id  # miloco turn:trace_id = run_id
-            # 新 session 重置 buffer(与 openclaw 一致——session 切换就清旧)
-            _turns.pop(run_id, None)
-            _get_or_init(run_id)
-    else:
-        with _lock:
-            # 非 miloco turn: 仅 init buffer(不下盘),但保留让 post hook 写 buffer
-            _turns.pop(run_id, None)
-            _get_or_init(run_id)
+    with _lock:
+        # 新 session 重置 buffer（与 openclaw 一致——session 切换就清旧）
+        _turns.pop(run_id, None)
+        _get_or_init(run_id)
     _record(run_id, "on_session_start", {"model": model, "platform": platform})
 
 
@@ -398,7 +369,7 @@ def _hk_on_session_end(session_id, completed, interrupted, model, platform, **kw
             _turns.pop(run_id, None)
             _gc_expired_turns()
             return
-        # 【hermes-pr.md §五 #11 迁移后】无条件落盘(去 debug 门槛)
+        # 落盘（debug 模式下）
         jsonl_path = _flush_to_disk(run_id, state, bool(completed))
         meta = _reduce_meta(state.buffer)
         meta["runId"] = run_id

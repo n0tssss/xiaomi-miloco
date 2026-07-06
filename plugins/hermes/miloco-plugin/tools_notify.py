@@ -1,28 +1,25 @@
 """miloco_im_push 通知投递。
 
-【hermes-pr.md §五 #4 对齐 OpenClaw】目标解析 + needsBind 两步握手 + 投递原语。
+对齐 OpenClaw 版 ``subagent.run({deliver:true})`` 的体验：装好就能用，cron
+场景下也能自动投递，不需要 LLM 配合做"两段式 bind"。
 
-**目标解析 `resolveNotifyTarget`**（【hermes-pr.md §五 #4 目标解析】）：
-1. ``state.json::deliver.target`` 显式配 → 直接用
-2. fallback 到最近活跃 IM home channel（扫 ~/.hermes/auth.json + config.yaml）
-3. 都没有 → 返回 ``needsBind=true``（agent 调 ``miloco_notify_bind`` 补 bindHint）
+**投递路径**：读插件 state.json 里的 ``deliver.target``（格式
+``platform[:chat_id[:thread_id]]``，对齐 Hermes 官方 ``hermes send`` CLI 的 ``--to`` 参数格式），通过
+``subprocess.run(["hermes", "send", "--to", target, "--json", "-q", body])`` 投递。
 
-**投递原语**（【hermes-pr.md §五 #4 投递原语】）：
-当前通过 ``subprocess hermes send --to`` 投递 —— Hermes 官方为 cron / ops script
-提供的 standalone 入口（hermes_cli/send_cmd.py），不依赖 agent loop、不需要
-gateway 运行（bot-token REST 直发, plugin 平台走 registry standalone_sender_fn）。
-
-**【未来替换】DeliveryRouter**：对齐 OpenClaw ``subagent.run({deliver:true})`` 走
-平台原生投递。需要 Hermes 侧提供明确的 ``ctx.deliver(target, body)`` API 或
-register_tool 的 deliver 能力 —— 当前 Hermes 版本未稳定暴露此 API（hermes 某
-版本起把 send_message 从 model tools 移除,见 tools/send_message_tool.py:
-1680-1691 注释）。待 Hermes API 稳定后切到 DeliveryRouter(简单替换
-_deliver_via_hermes_send 函数体即可,resolveNotifyTarget / needsBind 逻辑保留)。
+为什么不用 ``ctx.dispatch_tool("send_message", ...)``：Hermes 从某个版本起
+故意把 ``send_message`` 从 agent-callable model tools 里移除（见 hermes-agent
+源码 ``tools/send_message_tool.py:1680-1691`` 注释），目的是防止 agent 自作
+主张发跨平台消息。``hermes send`` 是 Hermes 官方为 cron / ops script / 监控
+daemon 提供的 standalone 入口（``hermes_cli/send_cmd.py``），不依赖 agent
+loop、不需要 gateway 运行（bot-token 类平台走 REST 直发，plugin 类平台走
+registry 的 standalone_sender_fn）。
 
 **state.json 由 install-hermes.sh 在安装时自动写**：探测 ~/.hermes/config.yaml
 里已配 bot_token 的 platform，取第一个作为默认 deliver target，用户零感知。
 若未检测到任何已配平台，state.json 里无 deliver 字段，im_push 返回
-``ok:false, needsBind:true, hint: "..."``，引导 agent 调 miloco_notify_bind 配 IM。
+``ok:false, error:"no deliver target configured"``，提示用户去 Hermes 里配 IM
+或手动编辑 state.json。
 """
 
 from __future__ import annotations
@@ -33,89 +30,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# state.json 文件名（与 OpenClaw 版 notify.ts 对齐，存于插件根目录）
+# state.json 文件名(与 OpenClaw 版 notify.ts 对齐,存于插件根目录)
 _STATE_FILENAME = "state.json"
 
-# hermes send CLI 超时（秒）。bot-token REST 投递通常 < 5s，留余量给慢通道
-_HERMES_SEND_TIMEOUT_S = 30
-
-
-def _state_path(ctx: Any) -> Path:
-    """插件目录下的 state.json。
-
-    优先级：
-    1. ``ctx.manifest.path`` —— dev 安装（fork 仓库）下是真目录
-    2. ``$HERMES_HOME/plugins/miloco/miloco-plugin/`` —— install-hermes.sh 的
-       唯一装入点（不管 dev / pip 装，state.json 实际都落这）
-    3. 兜底 ``~/.hermes/plugins/miloco/miloco-plugin/``
-
-    pip entry-point 装的 plugin（``manifest.path = "pkg.module:entry"``）不是
-    目录，不能用；直接走 2。
-    """
-    base = getattr(getattr(ctx, "manifest", None), "path", None)
-    if base and Path(base).is_dir():
-        return Path(base) / _STATE_FILENAME
-    # install-hermes.sh 把 plugin 装到 $HERMES_HOME/plugins/miloco/miloco-plugin/，
-    # state.json 也写这。这是 source of truth。
-    hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return hermes_home / "plugins" / "miloco" / "miloco-plugin" / _STATE_FILENAME
-
-
-def load_state(ctx: Any) -> Dict[str, Any]:
-    """读 state.json，缺失/损坏返回空 dict。"""
-    path = _state_path(ctx)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning("miloco state.json 解析失败 (%s): %s", path, exc)
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def save_state(ctx: Any, state: Dict[str, Any]) -> None:
-    """原子写 state.json（temp → rename）。失败仅 log，不抛。"""
-    path = _state_path(ctx)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
-    except OSError as exc:
-        logger.warning("miloco state.json 写入失败 (%s): %s", path, exc)
-
-
-def get_deliver_target(ctx: Any) -> Optional[str]:
-    """从 state.json 读 deliver.target；缺失返回 None。
-
-    返回值是 Hermes ``send_message`` 工具接受的 target 字符串，格式
-    ``platform[:chat_id[:thread_id]]``。裸 ``platform`` 表示用 home channel。
-    """
-    return load_state(ctx).get("deliver", {}).get("target") or None
-
-
-def set_deliver_target(ctx: Any, target: str) -> None:
-    """手动覆盖 deliver.target（高级用户用；正常路径 install-hermes.sh 自动写）。"""
-    state = load_state(ctx)
-    state["deliver"] = {
-        "target": target,
-        "auto_configured": False,
-        "configured_at": None,
-        "source": "manual set via plugin API",
-    }
-    save_state(ctx, state)
-
-
-# ---------------------------------------------------------------------------
-# 投递
-# ---------------------------------------------------------------------------
 
 def _detect_im_platforms_simple() -> List[str]:
     """扫 ~/.hermes/auth.json + config.yaml, 列出已配 bot_token 的 IM platform 名。
@@ -203,16 +124,91 @@ def resolve_notify_target(ctx: Any) -> Dict[str, Any]:
         "candidates": [],
     }
 
+# hermes send CLI 超时（秒）。bot-token REST 投递通常 < 5s，留余量给慢通道
+_HERMES_SEND_TIMEOUT_S = 30
+
+
+def _state_path(ctx: Any) -> Path:
+    """插件目录下的 state.json。
+
+    优先级：
+    1. ``ctx.manifest.path`` —— dev 安装（fork 仓库）下是真目录
+    2. ``$HERMES_HOME/plugins/miloco/miloco-plugin/`` —— install-hermes.sh 的
+       唯一装入点（不管 dev / pip 装，state.json 实际都落这）
+    3. 兜底 ``~/.hermes/plugins/miloco/miloco-plugin/``
+
+    pip entry-point 装的 plugin（``manifest.path = "pkg.module:entry"``）不是
+    目录，不能用；直接走 2。
+    """
+    base = getattr(getattr(ctx, "manifest", None), "path", None)
+    if base and Path(base).is_dir():
+        return Path(base) / _STATE_FILENAME
+    # install-hermes.sh 把 plugin 装到 $HERMES_HOME/plugins/miloco/miloco-plugin/，
+    # state.json 也写这。这是 source of truth。
+    hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return hermes_home / "plugins" / "miloco" / "miloco-plugin" / _STATE_FILENAME
+
+
+def load_state(ctx: Any) -> Dict[str, Any]:
+    """读 state.json，缺失/损坏返回空 dict。"""
+    path = _state_path(ctx)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("miloco state.json 解析失败 (%s): %s", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(ctx: Any, state: Dict[str, Any]) -> None:
+    """原子写 state.json（temp → rename）。失败仅 log，不抛。"""
+    path = _state_path(ctx)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        logger.warning("miloco state.json 写入失败 (%s): %s", path, exc)
+
+
+def get_deliver_target(ctx: Any) -> Optional[str]:
+    """从 state.json 读 deliver.target；缺失返回 None。
+
+    返回值是 Hermes ``send_message`` 工具接受的 target 字符串，格式
+    ``platform[:chat_id[:thread_id]]``。裸 ``platform`` 表示用 home channel。
+    """
+    return load_state(ctx).get("deliver", {}).get("target") or None
+
+
+def set_deliver_target(ctx: Any, target: str) -> None:
+    """手动覆盖 deliver.target（高级用户用；正常路径 install-hermes.sh 自动写）。"""
+    state = load_state(ctx)
+    state["deliver"] = {
+        "target": target,
+        "auto_configured": False,
+        "configured_at": None,
+        "source": "manual set via plugin API",
+    }
+    save_state(ctx, state)
+
+
+# ---------------------------------------------------------------------------
+# 投递
+# ---------------------------------------------------------------------------
 
 def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
-    """经 ``hermes send --to TARGET --json -q BODY`` 投递(【hermes-pr.md §五 #4 投递原语】)。
+    """经 ``hermes send --to TARGET --json -q BODY`` 投递。
 
-    【未来替换】DeliveryRouter 对齐 OpenClaw ``subagent.run({deliver:true})``:
-    需要 Hermes 侧明确暴露 ``ctx.deliver(target, body)`` 或 register_tool 的
-    deliver 能力 —— 当前 Hermes 版本未稳定暴露此 API(send_message 已从
-    model tools 移除, 见 tools/send_message_tool.py:1680-1691)。保留当前
-    subprocess hermes send 实现, 接口契约与 #4 文档对齐, 未来 Hermes API
-    稳定后切到 DeliveryRouter 简单替换函数体即可。
+    ``hermes`` CLI（hermes-agent/hermes_cli/send_cmd.py）是 Hermes 官方为
+    cron / ops script 提供的 standalone 入口。subprocess 调它而不是
+    ``ctx.dispatch_tool("send_message", ...)``，因为后者在当前 Hermes 版本里
+    会报 "Unknown tool: send_message"（send_message 已从 model tools 移除，
+    见 tools/send_message_tool.py:1680-1691 注释）。
 
     返回 ``{"ok": bool, "error"?: str, "platform"?: str, "chat_id"?: str}``。
     """
@@ -259,6 +255,8 @@ def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
             payload = {"error": f"hermes send 返回非 JSON: {stdout!r}"}
 
     # exit code: 0 = ok, 1 = delivery fail, 2 = usage error
+    # 接受 success=True 或 ok=True 作为成功标志（Hermes 当前用 success，但
+    # 前向兼容 ok=，未来 Hermes 改签名不会突然全挂）
     if proc.returncode == 0:
         if isinstance(payload, dict) and (
             payload.get("success") is True or payload.get("ok") is True
@@ -290,35 +288,51 @@ def _deliver_via_hermes_send(target: str, body: str) -> Dict[str, Any]:
 
 
 def notify_owner(ctx: Any, message: str) -> Dict[str, Any]:
-    """投递入口。组合 ``resolve_notify_target`` + ``_deliver_via_hermes_send``。
+    """投递入口。与 OpenClaw 版 ``notifyOwner`` 行为对齐：装好就能用。
 
-    needsBind=true → 返回 ok:false + needsBind:true + hint, 引导 agent
-    调 miloco_notify_bind(action='switch', target='...') 补 IM, 后续
-    重试 notify_owner 即可投递。 这是【hermes-pr.md §五 #4 needsBind 两步握手】。
+    没有 deliver target → 返回 ok:false + 明确错误，指引用户去装 IM 或手动
+    编辑 state.json。不再做"两段式 bind"——cron session 没人可对话，bind 走
+    不通。
 
-    fallback 路径: 没显式 target 但有 IM 平台 → 用 home channel, agent
-    收到 hint 知道是 fallback(可后续调 notify_bind 切到具体 chat_id)。
+    ``target == "all"`` → fanout：遍历 state.json::deliver.candidates 逐个
+    投递。Hermes 原生 cron 的 ``Deliver: all`` 是这语义，但 hermes send CLI
+    不支持 "all" target（会返 "Unknown platform: all"），所以 fanout 在 plugin 端做。
     """
-    resolved = resolve_notify_target(ctx)
-    target = resolved["target"]
-
-    if resolved.get("needsBind"):
+    target = get_deliver_target(ctx)
+    if not target:
         return {
             "ok": False,
-            "needsBind": True,
-            "error": resolved["hint"],
-            "hint": (
-                "agent 应调 miloco_notify_bind(action='switch', target='<platform>') 配 IM 后重试。"
-                "或手动编辑 state.json 加 deliver.target 字段。"
+            "error": (
+                "no deliver target configured. Run install-hermes.sh after connecting "
+                "an IM platform in Hermes, or manually edit state.json "
+                "(`{\"deliver\": {\"target\": \"telegram\"}}`)."
             ),
         }
-
     body = f"<miloco-notification>{message}</miloco-notification>"
-    result = _deliver_via_hermes_send(target, body)
-    # fallback 用法时返回 hint 提示 agent 后续可细化
-    if result.get("ok") and resolved.get("hint"):
-        result["note"] = resolved["hint"]
-    return result
+
+    # Fanout: target="all" → 逐个候选发
+    if target == "all":
+        state = load_state(ctx)
+        candidates = (state.get("deliver") or {}).get("candidates") or []
+        if not candidates:
+            return {
+                "ok": False,
+                "error": "deliver.target='all' 但 state.json::deliver.candidates 为空,装时没探测到任何 IM",
+            }
+        results = []
+        for c in candidates:
+            r = _deliver_via_hermes_send(c, body)
+            r["target"] = c
+            results.append(r)
+        any_ok = any(r.get("ok") for r in results)
+        return {
+            "ok": any_ok,
+            "mode": "fanout",
+            "results": results,
+            "ok_count": sum(1 for r in results if r.get("ok")),
+            "total": len(results),
+        }
+    return _deliver_via_hermes_send(target, body)
 
 
 # ---------------------------------------------------------------------------

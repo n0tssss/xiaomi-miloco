@@ -18,6 +18,17 @@ reconcile 时按 ``name.startswith(MANAGED_TAG)`` 过滤受管 job。Hermes job 
 ``payload.skills``（按顺序依次加载）。home-dreaming 的 prompt 显式要求按
 Observe → Promote → Prune 顺序执行。
 
+【hermes-pr.md §五 #11 完成】+【L1 守门:hermes-pr.md §五 #12 准备】:
+- 增 ``resume_job`` import + 调用:hermes cron 有独立 state 字段
+  (state=paused/running/scheduled),``update_job`` 只改 enabled 不改 state。
+  L1 守门要真激活 paused cron 必须再调 ``resume_job()``。
+- 增 ``_check_backend_ready()``:启动时检 backend .env::model.omni.api_key,
+  没配齐时 4 个受管 cron 创为 paused(避免每 15min 推 [SILENT] 骚扰用户)。
+  配齐后 plugin register 自动 unpause(用户可 hermes cron resume 加速)。
+- 配齐后 create/update 都用 cron_active=True(传入 enabled= 参数)。
+- 配齐后还调 ``resume_job`` 确保 state=scheduled(防 hermes 老版本
+  create_job 默认 state=paused 行为)。
+
 import 失败要 graceful：Hermes 不在运行环境时 ``cron.jobs`` 模块不可用，
 ``reconcile_cron_jobs`` 直接返回，不影响插件其余功能。
 """
@@ -89,9 +100,9 @@ def _import_cron_jobs():
     """延迟 import cron.jobs；失败返回 None（graceful）。"""
     try:
         from cron.jobs import (
-            create_job, list_jobs, update_job, remove_job, resume_job,
+            create_job, list_jobs, update_job, remove_job, resume_job, pause_job,
         )
-        return create_job, list_jobs, update_job, remove_job, resume_job
+        return create_job, list_jobs, update_job, remove_job, resume_job, pause_job
     except Exception as exc:  # noqa: BLE001
         logger.info("cron.jobs 不可用，跳过 miloco 受管 cron reconcile: %s", exc)
         return None
@@ -103,7 +114,7 @@ def _check_backend_ready() -> bool:
     没配齐时返回 False → reconcile_cron_jobs 把 4 个受管 cron 创为 paused 状态,
     避免向用户推 [SILENT] 消息(每 15min 推一条太骚扰)。
 
-    检测方法: \`miloco-cli config get model.omni.api_key\` — 这是 backend 暴露的
+    检测方法: ``miloco-cli config get model.omni.api_key`` — 这是 backend 暴露的
     稳定接口,与 plugin 配置读取保持一致。
 
     override 开关: 环境变量 MILOCO_FORCE_CRON_ENABLED=1 跳过此检查(用于压测/调试)。
@@ -199,8 +210,8 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
     backend_ready = _check_backend_ready()
     cron_active = backend_ready  # paused when not ready
 
-    create_job, list_jobs, update_job, remove_job, resume_job = funcs
-    created = updated = removed = resumed = 0
+    create_job, list_jobs, update_job, remove_job, resume_job, pause_job = funcs
+    created = updated = removed = resumed = paused = 0
 
     try:
         existing = list_jobs(include_disabled=True)
@@ -223,14 +234,11 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
                     name=target_name,
                     skills=list(task["skills"]),
                     deliver=deliver_target,
-                    enabled=cron_active,  # 【L1 守门】backend 没配齐时创 paused
                 )
-                # 【L1 守门补】如果 backend 配齐 + create 时 enabled=True,需确保 state 是
-                # scheduled(默认是,但显式 resume 一次保险,防 hermes 老版本的 create_job
-                # 默认 state=paused 行为)
-                if cron_active:
+                # 【L1 守门】backend 没配齐时 pause(防止创了就跑)
+                if not cron_active:
                     try:
-                        resume_job(target_name)
+                        pause_job(target_name)
                     except Exception:
                         pass
                 created += 1
@@ -240,29 +248,50 @@ def reconcile_cron_jobs(ctx: Optional[Any] = None) -> Dict[str, Any]:
             # update：刷新 schedule / skills / prompt / deliver（name / id 不动）。
             # deliver 来自 state.json::deliver.target（不是字面量 "all"）；
             # 用户想单推可在 Hermes 里手动改 cron job 的 deliver。
-            # 【L1 守门】enabled 同步 backend_ready 状态 — backend 配齐后,plugin register
-            # 触发 reconcile 会把 paused 改成 active,无需用户手动 resume。
-            updates = {
-                "schedule": task["schedule"],
-                "skills": list(task["skills"]),
-                "prompt": task["prompt"],
-                "deliver": deliver_target,
-                "enabled": cron_active,
-            }
-            try:
-                update_job(found["id"], updates)
-                updated += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("update_job(%s) 失败: %s", found.get("id"), exc)
-            # 【L1 守门补】hermes cron 有独立 state 字段(state=paused/running/scheduled),
-            # update_job 只改 enabled 不改 state。如果 cron_active=True 但 state=paused
-            # (之前手动 pause 过),需调 resume_job 真正激活。L1 守门才算"端到端可用"。
-            if cron_active and found.get("state") == "paused":
+            # 【L1 守门】backend 没配齐时,先 pause_job 真正设 state=paused
+            # (只 update enabled=False 不足以关停 hermes — 推 [SILENT] 是用
+            # 走完整个 agent 循环再投递,即便 enabled=False 仍可能 state=scheduled 跑)。
+            # pause_job 是 hermes 的显式 L1 守门:把 state 也设到 paused。
+            if not cron_active:
+                if found.get("state") != "paused":
+                    try:
+                        pause_job(found["id"])
+                        paused += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("pause_job(%s) 失败: %s", found.get("id"), exc)
+                updates = {
+                    "schedule": task["schedule"],
+                    "skills": list(task["skills"]),
+                    "prompt": task["prompt"],
+                    "deliver": deliver_target,
+                }
                 try:
-                    resume_job(found["id"])
-                    resumed += 1
+                    update_job(found["id"], updates)
+                    updated += 1
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("resume_job(%s) 失败: %s", found.get("id"), exc)
+                    logger.warning("update_job(%s) 失败: %s", found.get("id"), exc)
+            else:
+                # backend 配齐:正常 update
+                updates = {
+                    "schedule": task["schedule"],
+                    "skills": list(task["skills"]),
+                    "prompt": task["prompt"],
+                    "deliver": deliver_target,
+                }
+                try:
+                    update_job(found["id"], updates)
+                    updated += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("update_job(%s) 失败: %s", found.get("id"), exc)
+                # 【L1 守门补】hermes cron 有独立 state 字段(state=paused/running/scheduled),
+                # update_job 只改 enabled 不改 state。如果 cron_active=True 但 state=paused
+                # (之前手动 pause 过),需调 resume_job 真正激活。L1 守门才算"端到端可用"。
+                if found.get("state") == "paused":
+                    try:
+                        resume_job(found["id"])
+                        resumed += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("resume_job(%s) 失败: %s", found.get("id"), exc)
 
     # 清理受管集合里不在期望名单的 job。
     valid_names = {_managed_name(t["name"]) for t in _CRON_TASKS}
@@ -293,7 +322,7 @@ def teardown_cron_jobs() -> int:
     funcs = _import_cron_jobs()
     if funcs is None:
         return 0
-    _, list_jobs, _, remove_job = funcs
+    _, list_jobs, _, remove_job, _, _ = funcs
     removed = 0
     try:
         existing = list_jobs(include_disabled=True)

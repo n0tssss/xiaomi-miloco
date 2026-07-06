@@ -52,15 +52,25 @@ class _Recording:
             self.calls.append(("resume", jid))
         return _resume
 
+    def make_pause(self):
+        def _pause(jid, reason=None):
+            self.calls.append(("pause", jid, reason))
+        return _pause
+
 
 def _stub_import_cron_jobs(rec: _Recording):
-    """返回 lambda,匹配 cron_setup._import_cron_jobs 的 (create, list, update, remove, resume) 元组。"""
+    """返回 lambda,匹配 cron_setup._import_cron_jobs 的 (create, list, update, remove, resume, pause) 元组。
+
+    PR3 (L1 守门补): 加 pause_job 让 backend 没配齐时真正 set state=paused
+    (只 update enabled=False 不足以关停 hermes 推 [SILENT] 消息)。
+    """
     funcs = (
         rec.make_create(),
         rec.make_list(),
         rec.make_update(),
         rec.make_remove(),
         rec.make_resume(),
+        rec.make_pause(),
     )
     return lambda: funcs
 
@@ -139,11 +149,11 @@ def _stub_check_backend_ready(ready: bool):
 
 
 def test_reconcile_creates_crons_paused_when_backend_not_ready(monkeypatch, tmp_path):
-    """backend .env 没配齐 model key → 4 个 cron 都创为 enabled=False(paused)。
+    """backend .env 没配齐 model key → create_job 后调 pause_job。
 
     防骚扰:没配 key 时 cron 跑也返 [SILENT],hermes 仍发 Cronjob Response
     通知,每 15min 推一条太烦。守门:register 时检 backend 配齐才 active,没配齐
-    创 paused(用户填 .env 后下次 plugin register 自动激活,无需手动 resume)。
+    创完立刻 pause(用户填 .env 后下次 plugin register 自动激活,无需手动 resume)。
     """
     rec = _Recording(existing=[])
     monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
@@ -153,17 +163,15 @@ def test_reconcile_creates_crons_paused_when_backend_not_ready(monkeypatch, tmp_
     result = cron_setup.reconcile_cron_jobs()
 
     creates = [c for c in rec.calls if c[0] == "create"]
+    pauses = [c for c in rec.calls if c[0] == "pause"]
     assert len(creates) == 4, "4 个受管 cron 都应被创建"
-    for c in creates:
-        assert c[1]["enabled"] is False, (
-            f"backend 没配齐时,所有 cron 应创为 paused,实际 enabled={c[1].get('enabled')}"
-        )
+    assert len(pauses) == 4, "backend 没配齐时,create 后应调 pause_job"
     assert result.get("active") is False
-    assert result.get("skipped") is False  # 不是 skipped,只是 active=False
+    assert result.get("skipped") is False
 
 
 def test_reconcile_creates_crons_active_when_backend_ready(monkeypatch, tmp_path):
-    """backend 配齐 model key → 4 个 cron 创为 enabled=True(正常路径)。"""
+    """backend 配齐 model key → 只 create,不调 pause_job(正常路径)。"""
     rec = _Recording(existing=[])
     monkeypatch.setattr(cron_setup, "_import_cron_jobs", _stub_import_cron_jobs(rec))
     monkeypatch.setattr(cron_setup, "get_deliver_target", lambda ctx=None: "weixin:abc")
@@ -172,14 +180,14 @@ def test_reconcile_creates_crons_active_when_backend_ready(monkeypatch, tmp_path
     result = cron_setup.reconcile_cron_jobs()
 
     creates = [c for c in rec.calls if c[0] == "create"]
+    pauses = [c for c in rec.calls if c[0] == "pause"]
     assert len(creates) == 4
-    for c in creates:
-        assert c[1]["enabled"] is True, "backend 配齐时,所有 cron 应创为 active"
+    assert len(pauses) == 0, "backend 配齐时,不应调 pause_job"
     assert result.get("active") is True
 
 
 def test_reconcile_update_pauses_existing_cron_when_backend_not_ready(monkeypatch):
-    """已有 cron 是 active,backend 突然没配齐 → update 改 enabled=False(自动 pause)。"""
+    """已有 cron 是 active,backend 突然没配齐 → update 后调 pause_job(自动 pause)。"""
     existing = [
         {"id": "abc-123", "name": "[miloco:home-profile] miloco-perception-digest"},
     ]
@@ -191,8 +199,9 @@ def test_reconcile_update_pauses_existing_cron_when_backend_not_ready(monkeypatc
     cron_setup.reconcile_cron_jobs()
 
     updates = [c for c in rec.calls if c[0] == "update"]
+    pauses = [c for c in rec.calls if c[0] == "pause"]
     assert len(updates) == 1
-    assert updates[0][2]["enabled"] is False, "update 应把 enabled 改 False"
+    assert len(pauses) == 4, "backend 没配齐时,已有+新建的全部 cron 都 pause"
 
 
 def test_reconcile_resumes_existing_paused_cron_when_backend_ready(monkeypatch):
@@ -223,7 +232,6 @@ def test_reconcile_resumes_existing_paused_cron_when_backend_ready(monkeypatch):
     updates = [c for c in rec.calls if c[0] == "update"]
     resumes = [c for c in rec.calls if c[0] == "resume"]
     assert len(updates) == 4
-    assert all(u[2]["enabled"] is True for u in updates)
     assert len(resumes) == 1, "只有 1 个 paused → 只有 1 个 resume"
     assert resumes[0][1] == "abc-123"
     assert result.get("resumed") == 1
@@ -273,10 +281,9 @@ def test_reconcile_force_env_overrides_backend_check(monkeypatch, tmp_path):
     result = cron_setup.reconcile_cron_jobs()
 
     creates = [c for c in rec.calls if c[0] == "create"]
-    for c in creates:
-        assert c[1]["enabled"] is True, (
-            "override env 1 应跳过 .env 检测,创 active cron(即便 key 为空)"
-        )
+    pauses = [c for c in rec.calls if c[0] == "pause"]
+    assert len(creates) == 4
+    assert len(pauses) == 0, "override env 跳过检测,不应调 pause_job"
     assert result.get("active") is True
 
 

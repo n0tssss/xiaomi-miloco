@@ -22,8 +22,7 @@ GUIDE = Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "inst
 def test_guide_has_3_step_quick_install():
     """开头必须有用户的 3 步速装命令（git clone / install-hermes.sh / hermes gateway restart）。
 
-    merge 后 URL 指向主仓(hermes-pr.md §四 §5 README URL 修复):
-    【hermes-pr.md Zirconi 🔴 修复】原来指向 fork,merge 后用户装会撞 bug。
+    ci-bot 6/29 #4 修法:URL 改主仓 `XiaoMi/xiaomi-miloco`,不再指 fork。
     """
     text = GUIDE.read_text(encoding="utf-8")
     assert "git clone https://github.com/XiaoMi/xiaomi-miloco.git" in text
@@ -32,43 +31,37 @@ def test_guide_has_3_step_quick_install():
 
 
 def test_guide_has_5_step_verification():
-    """Step 3.1 验证清单。
-
-    【hermes-pr.md Zirconi 🟡 修复】原 5 步含独立 adapter 进程步骤(18789/health / adapter)—
-    新架构(hermes-pr.md §五 #1 完成)已删独立 adapter 进程,验证清单需对齐。
-    """
+    """Step 3.1 必须有 5 步验证清单：plugins list / skills count / state.json / adapter / backend。"""
     text = GUIDE.read_text(encoding="utf-8")
     assert "hermes plugins list" in text
     assert "miloco-*" in text
     assert "state.json" in text
+    assert "miloco-adapter.sh status" in text
+    assert "18789/health" in text
     assert "1810/health" in text
-    assert "install-hermes.sh --diagnose" in text
 
 
 def test_guide_has_status_report_with_local_urls():
-    """Step 3.2 状态报告含本地链接段。
-
-    【hermes-pr.md Zirconi 🟡 修复】原断言含 :18789(独立 adapter)和 :8642(hermes gateway)
-    — :18789 已被 #1 完成删除,只留 :1810(backend)+ :8642(hermes,作为对照)。
-    """
+    """Step 3.2 状态报告必须含本地链接段（用户能直接 copy）。"""
     text = GUIDE.read_text(encoding="utf-8")
     # 必须有本地链接段
     assert "本地链接" in text or "本地 URL" in text or "local" in text.lower()
-    # 必须含关键本地 URL(backend + hermes gateway,不再含 :18789)
+    # 必须含关键本地 URL
     assert "127.0.0.1:1810" in text
+    assert "127.0.0.1:18789" in text
     assert "127.0.0.1:8642" in text
-    # :18789(独立 adapter)已删,不再要求
 
 
 def test_guide_has_active_test_suggestion():
-    """Step 3.3 主动引导用户跑真实自检。
+    """Step 3.3 必须主动引导用户跑真实动作（PR #279 收敛后改 wrapper 脚本）。
 
-    【hermes-pr.md Zirconi 修复】miloco_status / miloco-test_push 已删(#3 裁 tool);
-    引导用户跑 install-hermes.sh --diagnose 替代(system 工具,不走 plugin 路径)。
+    Author #3 收敛:miloco_status / miloco_test_push 不再是 agent tool,改外部 wrapper
+    ``plugins/hermes/scripts/miloco-status.sh <subcmd>``。所以引导文案要更新。
     """
     text = GUIDE.read_text(encoding="utf-8")
-    # 引导用户跑 self-test system 工具(替代已删的 miloco_status)
-    assert "--diagnose" in text
+    assert 'miloco-status.sh' in text, "应引导用户跑 wrapper 脚本"
+    # 残留检测:miloco_status 作为 tool 调用应该没了（只剩外部脚本引用）
+    assert 'miloco_status' not in text or 'miloco-status.sh' in text
 
 
 def test_guide_no_meta_instruction_block():

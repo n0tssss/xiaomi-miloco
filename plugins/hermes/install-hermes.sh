@@ -4,30 +4,41 @@
 # 干 7 件事：
 #   1. 前置检查（hermes、miloco-cli、python、$MILOCO_HOME、$MILOCO_HOME/config.json）
 #   2. 跑 scripts/sync-skills.py 生成 16 个 skill，复制到 ~/.hermes/skills/
-#   3. 复制 miloco 插件到 ~/.hermes/plugins/miloco/，复制 adapter 到同目录
+#   3. 复制 miloco 插件到 ~/.hermes/plugins/miloco/（架构 #1+#2 后不再复制独立 adapter 进程,入站走 backend AgentPlatformAdapter）
 #   4. 自动 patch ${MILOCO_HOME}/config.json 的 agent 段（webhook_url + auth_bearer，备份原文件）
 #   5. 自动给 ~/.hermes/.env 补 API_SERVER_KEY（如缺失则生成；存在则复用）
-#   6. 停掉旧 adapter（按 pid 文件），nohup 启新 adapter，PID 写到 ~/.hermes/miloco-adapter.pid
-#   7. 打印终态：PID / 日志路径 / 后续唯一要做的步骤
+#   6. 重启 miloco-backend（supervisord 管理），确保适配器收敛到 backend AgentPlatformAdapter
+#   7. 打印终态：后端 PID / 日志路径 / 后续唯一要做的步骤
 #
-# 幂等：再跑一次不会破坏现有配置，会重启 adapter 保留同一 Bearer。
+# 幂等：再跑一次不会破坏现有配置，会重启 backend 保留同一 Bearer。
 # 还原：$MILOCO_HOME/config.json.bak-* 是 patch 前的备份，~/.hermes/.env 自行删 API_SERVER_KEY 即可。
 #
-# 高级/手动安装请用 scripts/install.sh（不做 patch、不启 adapter）。
-# adapter 启停 / 日志请用 scripts/miloco-adapter.sh。
+# 高级/手动安装请用 scripts/install.sh（不做 patch、不启 backend）。
+# backend 启停 / 日志请用 scripts/miloco-adapter.sh。
 
 set -euo pipefail
 
 # 强制 UTF-8 + POSIX 字符类，防止 "$VAR中文" 被 bash 误识别为变量名延续
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# --- CLI 参数解析（--diagnose / --reset-deliver） ---
+# --- CLI 参数解析（--diagnose / --reset-deliver / --notify-mode / --notify-primary） ---
 DIAGNOSE_ONLY=0
 NO_START_BACKEND=0
+NOTIFY_MODE=""           # "fanout" (全部发) / "single" (单发) / "" (TYY 交互问)
+NOTIFY_PRIMARY=""        # "1" / "2" / "3"...  选 candidates 的第几个
 for arg in "$@"; do
   case "$arg" in
     --diagnose) DIAGNOSE_ONLY=1 ;;
     --no-start-backend) NO_START_BACKEND=1 ;;
+    --notify-mode=*) NOTIFY_MODE="${arg#*=}" ;;
+    --notify-mode)
+      # 下一参数是值
+      shift_next=1
+      ;;
+    --notify-primary=*) NOTIFY_PRIMARY="${arg#*=}" ;;
+    --notify-primary)
+      shift_next=1
+      ;;
     --help|-h)
       cat <<EOF
 用法：bash install-hermes.sh [options]
@@ -35,12 +46,49 @@ for arg in "$@"; do
   --diagnose         自检模式：跑 12 项检查输出 ✓/✗，不做任何修改
   --no-start-backend 跳过自动 miloco-cli service start（upstream install 退出时 atexit 杀掉的）
   --reset-deliver    清空 state.json::deliver.target，强制重新探测 IM（搭配安装用）
+  --notify-mode MODE  非交互模式：fanout（全部 IM 都发）/ single（只发主渠道）
+  --notify-primary N  非交互模式：选第 N 个 candidate 作为 single 模式的主渠道（默认 1）
   -h, --help         显示本帮助
+
+非交互用法（CI / agent）：
+  MILOCO_NOTIFY_MODE=fanout bash install-hermes.sh
+  MILOCO_NOTIFY_MODE=single MILOCO_NOTIFY_PRIMARY=2 bash install-hermes.sh
+
+交互用法（默认 TTY）：
+  bash install-hermes.sh         # 自动 ask"fanout 还是 single / 哪个 primary"
 EOF
       exit 0
       ;;
   esac
 done
+# 解析 --notify-mode / --notify-primary 后面跟值的格式
+i=0
+for arg in "$@"; do
+  i=$((i + 1))
+  case "$arg" in
+    --notify-mode)
+      next="${ARGV[$((i+1))]:-}"
+      [ -n "$next" ] && NOTIFY_MODE="$next" && shift $((i+1)) 2>/dev/null || true
+      ;;
+    --notify-primary)
+      next="${ARGV[$((i+1))]:-}"
+      [ -n "$next" ] && NOTIFY_PRIMARY="$next" && shift $((i+1)) 2>/dev/null || true
+      ;;
+  esac
+done
+# 上面 ARGV 不可用(没用 declare -a),改用第二个 for 循环
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    --notify-mode)  [ -z "$NOTIFY_MODE" ] && NOTIFY_MODE="$arg" ;;
+    --notify-primary) [ -z "$NOTIFY_PRIMARY" ] && NOTIFY_PRIMARY="$arg" ;;
+  esac
+  prev="$arg"
+done
+unset prev
+# env 兜底 (set -u 兼容:env var 可能未设)
+NOTIFY_MODE="${NOTIFY_MODE:-${MILOCO_NOTIFY_MODE:-}}"
+NOTIFY_PRIMARY="${NOTIFY_PRIMARY:-${MILOCO_NOTIFY_PRIMARY:-}}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -50,6 +98,7 @@ ADAPTER_PORT="${ADAPTER_PORT:-18789}"
 ADAPTER_LOG="$HERMES_HOME/miloco-adapter.log"
 ADAPTER_PID="$HERMES_HOME/miloco-adapter.pid"
 HERMES_PLUGINS_DIR="$HERMES_HOME/plugins/miloco"
+LAUNCHD_LABEL="com.xiaomi.miloco.hermes.adapter"  # 旧架构残留清理
 
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
 info() { echo -e "${G}[✓]${N} $*"; }
@@ -226,7 +275,8 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
 
   # 9. plugin enabled
   if command -v hermes >/dev/null 2>&1; then
-    # 同 step 8：严格匹配 status 列，避免 "not enabled" 假阳性
+    # 同 step 8：对齐 install-guide-hermes.md:295 的严格模式
+    # ^enabled.*miloco$ —— 行内 "enabled" 在前、"miloco" 在后，避免 not enabled 假阳性
     if hermes plugins list --plain --no-bundled 2>/dev/null | grep -E "^enabled.*miloco$" >/dev/null 2>&1; then
       diag "plugin enabled (hermes plugins list)" 1
     else
@@ -236,30 +286,31 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
     diag "plugin enabled" 0 "找不到 hermes CLI"
   fi
 
-  # 10. 【hermes-pr.md §五 #1 完成】独立 adapter 进程已弃用,改为提示
-  # 期望:adapter launchd 已清理 / 端口 18789 无进程。
-  # 若发现残留 → warn(可能 PR #279 未干净)而不是 fail,不影响诊断通过。
-  _STALE_ADAPTER=0
-  if [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
-    if launchctl list 2>/dev/null | grep -q "com.xiaomi.miloco.hermes.adapter"; then
-      diag "adapter (launchd)" 1 "⚠ 已清理/弃用(PR #279 残留 launchd) — 新架构无独立 adapter"
-      _STALE_ADAPTER=1
+  # 10. miloco-backend 在跑（supervisord 管理）
+  # 架构 #1+#2 后适配器收敛到 backend AgentPlatformAdapter，
+  # 不再需要独立 adapter 进程。
+  sv_running=0
+  if pgrep -f "supervisord.*$MILOCO_HOME" >/dev/null 2>&1; then
+    sv_running=1
+  fi
+  backend_running=0
+  if [ "$sv_running" -eq 1 ] && command -v supervisorctl >/dev/null 2>&1; then
+    st="$(SKIP_PLUGIN_CHECK=0 supervisorctl -c "$MILOCO_HOME/supervisord.conf" status miloco-backend 2>/dev/null || echo "")"
+    if [[ "$st" == *RUNNING* ]]; then
+      backend_running=1
     fi
   fi
-  if [ "$_STALE_ADAPTER" -eq 0 ]; then
-    diag "adapter (launchd)" 1 "N/A(新架构,backend AgentPlatformAdapter 直调;无独立进程)"
+  if [ "$backend_running" -eq 1 ]; then
+    diag "miloco-backend (supervisord)" 1 "RUNNING"
+  elif [ "$sv_running" -eq 1 ]; then
+    diag "miloco-backend (supervisord)" 0 "supervisord 在跑但 miloco-backend 未启动 → 重跑 install-hermes.sh"
+  else
+    diag "miloco-backend (supervisord)" 0 "supervisord 未在跑 → 重跑 install-hermes.sh"
   fi
 
-  # 11. 【hermes-pr.md §五 #1 完成】adapter /health 同样 N/A
-  ADAPTER_HEALTH=""
-  if command -v curl >/dev/null 2>&1 && [ "$_STALE_ADAPTER" -eq 1 ]; then
-    ADAPTER_HEALTH="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$ADAPTER_PORT/health" 2>/dev/null || echo "")"
-    if [ "$ADAPTER_HEALTH" = "200" ]; then
-      diag "adapter /health" 1 "⚠ 端口 $ADAPTER_PORT 还响应 HTTP 200(原独立 adapter 残留,请清)"
-    fi
-  fi
-  if [ "$_STALE_ADAPTER" -eq 0 ]; then
-    diag "adapter /health" 1 "N/A(新架构,无独立 adapter 进程)"
+  # 11. 检查旧 launchd adapter 是否残留（旧架构遗留）
+  if launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL" 2>/dev/null; then
+    diag "旧 launchd adapter 残留" 0 "launchctl unload ~/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
   fi
 
   # 12. state.json::deliver.target
@@ -394,7 +445,7 @@ if [ -d "$MILOCO_HOME" ]; then
     warn "半装残留：supervisord.sock 存在但 supervisord.conf 缺失"
     warn "  这通常是上次 --agent-prepare 异常退出留下的"
     warn "  修复：miloco-cli service stop"
-    warn "        或手动：supervisorctl shutdown（shutdown 是 supervisorctl 子命令，不是 supervisord 的）"
+    warn "        或手动：ps aux | grep supervisord，然后 kill <PID>"
   fi
   # 情况 2: PID 文件存在但进程已死
   if [ -f "$SUPERVISORD_PID" ]; then
@@ -479,7 +530,7 @@ except Exception:
       fi
     fi
 
-if [ -n "$FOUND_PY" ]; then
+    if [ -n "$FOUND_PY" ]; then
       info "auto-fix: config.json::server.python_bin = $FOUND_PY"
       "$PYTHON" - "$MILOCO_HOME" "$FOUND_PY" <<'PY'
 import json, sys
@@ -494,27 +545,27 @@ cfg.setdefault("server", {})["python_bin"] = py_bin
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 PY
     else
-      warn "config.json::server.python_bin auto-fix 失败:找不到能 import miloco 的 python"
-      warn "手动修:${MILOCO_HOME}/config.json::server.python_bin = <装 miloco 包的 python 路径>"
+      warn "config.json::server.python_bin auto-fix 失败：找不到能 import miloco 的 python"
+      warn "手动修：${MILOCO_HOME}/config.json::server.python_bin = <装 miloco 包的 python 路径>"
     fi
   fi
 fi
 
+mark_done 1
+
 # --- 1.9 【hermes-pr.md §五 #10 MILOCO_HOME 显式配置】 ---
 # doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。
-# 默认 ~/.openclaw/miloco,本步改 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
+# 默认 ~/.openclaw/miloco,本步切到 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
 #
-# 实现策略(symlink + 防御性 supervisor conf 写入 + shell rc):
-# 1. **symlink**: `~/.hermes/miloco -> ~/.openclaw/miloco`(避免数据迁移,功能等价)
-# 2. **防御性改 supervisor conf**(被 miloco-cli service start 每次重新生成覆盖,
-#    但写一次不影响功能,只是下次 regen 之前能用)
-# 3. **写 ~/.zshrc / ~/.bashrc**:对交互式 shell 生效;对 macOS launchd 起的
-#    hermes/supervisor 进程不生效(launchd 不 source 用户 shell rc),所以
-#    完全对齐到 ~/.hermes/miloco 需要额外编辑 ~/Library/LaunchAgents/*.plist
-#    加 EnvironmentVariables.MILOCO_HOME(侵入性强,本脚本不做)。
-# 4. **结论**:本 session 接受默认 ~/.openclaw/miloco + symlink 兜底,真要全
-#    迁移请用户手动 rsync + 改 plist(写到 wiki session-log 指引)。
-
+# 实现策略:
+# 1. 创建 symlink ~/.hermes/miloco → ~/.openclaw/miloco(避免数据迁移)
+# 2. 写 export MILOCO_HOME=~/.hermes/miloco 到 ~/.zshrc + ~/.bashrc(用户 shell rc)
+#    —— 关键:miloco-cli service start 每次都重新生成 supervisord.conf(用
+#    miloco_home() 的当前值,直接读环境),所以 supervisor conf 写什么不重要,
+#    重要的是 supervisor 进程(macOS 是 launchd 启动的 shell)能拿到 MILOCO_HOME env。
+# 3. 改 supervisord.conf 的 environment(防御性,launchd 父进程若不传 env 时兜底)
+# 4. supervisorctl reread + update(下次 backend 重启继承)
+step 1.9 "MILOCO_HOME 显式配置 ${HERMES_HOME}/miloco"
 MILOCO_HOME_HERMES="${HERMES_HOME}/miloco"
 if [ ! -e "$MILOCO_HOME_HERMES" ] && [ -d "$MILOCO_HOME" ]; then
   info "  创建 symlink: $MILOCO_HOME_HERMES -> $MILOCO_HOME (避免数据迁移)"
@@ -522,7 +573,9 @@ if [ ! -e "$MILOCO_HOME_HERMES" ] && [ -d "$MILOCO_HOME" ]; then
 elif [ -d "$MILOCO_HOME_HERMES" ] && [ ! -L "$MILOCO_HOME_HERMES" ]; then
   warn "  $MILOCO_HOME_HERMES 已是真实目录(非 symlink),不强行覆盖"
 fi
-# 写用户 shell rc(对交互式 shell 生效,launchd 起的进程不生效 — 见上注释)
+# 写用户 shell rc(关键路径:macOS supervisor 由 launchd 启动,env 来自 launchd
+# → 父进程 shell → shell rc。如果 shell rc 设了 MILOCO_HOME,supervisor 子进程
+# 继承,生成的 supervisord.conf::environment=MILOCO_HOME 才会用对的值)
 SHELL_RC_LIST=()
 [ -f "$HOME/.zshrc" ] && SHELL_RC_LIST+=("$HOME/.zshrc")
 [ -f "$HOME/.bashrc" ] && SHELL_RC_LIST+=("$HOME/.bashrc")
@@ -539,16 +592,17 @@ PY
       info "  $_rc: export MILOCO_HOME 已更新"
     else
       echo "" >> "$_rc"
-      echo "# miloco Hermes 兼容层(${MILOCO_HOME_HERMES:-默认 ~/.openclaw/miloco})" >> "$_rc"
+      echo "# miloco Hermes 兼容层(MILOCO_HOME=${MILOCO_HOME_HERMES:-默认 ~/.openclaw/miloco})" >> "$_rc"
       echo "export MILOCO_HOME=\"$MILOCO_HOME_HERMES\"" >> "$_rc"
-      info "  $_rc: export MILOCO_HOME 已追加(对交互式 shell 生效,launchd 起的进程不生效)"
+      info "  $_rc: export MILOCO_HOME 已追加"
     fi
   done
 else
   warn "  ~/.zshrc / ~/.bashrc 都不存在,无法持久化 MILOCO_HOME"
   warn "  手动在 shell rc 加: export MILOCO_HOME=\"$MILOCO_HOME_HERMES\""
 fi
-# 防御性改 supervisor conf(会被 miloco-cli service start 覆盖,但短期生效)
+# 改 supervisor conf 把 MILOCO_HOME env 切到 ~/.hermes/miloco
+# (注意 miloco-cli service start 每次会重新生成,这里写只是防御,真生效靠 shell rc)
 SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
 if [ -f "$SUPERVISORD_CONF" ]; then
   if grep -q 'MILOCO_HOME=' "$SUPERVISORD_CONF"; then
@@ -558,188 +612,16 @@ path, new_home = sys.argv[1], sys.argv[2]
 text = open(path, encoding='utf-8').read()
 text = re.sub(r'MILOCO_HOME="[^"]*"', f'MILOCO_HOME="{new_home}"', text)
 open(path, 'w', encoding='utf-8').write(text)
-print(f"  supervisord.conf::MILOCO_HOME = {new_home} (防御性写入,真生效靠 shell rc / plist EnvironmentVariables)")
+print(f"  supervisord.conf::MILOCO_HOME = {new_home} (防御性,被 miloco-cli start 覆盖时由 shell rc 兜底)")
 PY
   fi
 fi
-
-# --- 1.9 【hermes-pr.md Zirconi 🟡 修复】web 静态目录注入 ---
-
-# --- 1.9 【hermes-pr.md Zirconi 🟡 修复】web 静态目录注入 ---
-# 当前 fork 未提交 web/dist/(git ls-tree -r HEAD -- web/dist/ 为空),
-# Step 1.9 永远走 elif warn 分支 no-op,误导用户。修法:
-# 选项 A: 二选一(prebuilt 提交进仓库 OR 删 Step)
-# 选项 B: 检测 dist 存在才 cp,不存在直接跳过且不打印误导性信息
-# 本脚本走 B(保守)— dist 不存在就静默 skip + 提示用户具体修复路径。
-#
-# 跳过条件: web/dist/ 不存在(开发者本地需 \`npm run build\` 后 \`git add web/dist\` 提交)。
-
-WEB_SRC="$(dirname "$HERE")/../web"   # <fork>/web
-WEB_DIST="$WEB_SRC/dist"
-
-if [ -d "$WEB_DIST" ]; then
-  step 1.9 "注入 web 静态目录 (cp prebuilt dist → backend static_dir)"
-  # 找 backend 的 static_dir(uv tool venv 优先)
-  MILOCO_PY="$PYTHON"
-  for _cand in \
-    "$HOME/.local/share/uv/tools/miloco/bin/python" \
-    "$HOME/.local/share/uv/tools/miloco/bin/python3"; do
-    if [ -x "$_cand" ]; then
-      MILOCO_PY="$_cand"
-      break
-    fi
-  done
-  STATIC_DIR="$("$MILOCO_PY" -c "
-try:
-    from miloco.config.settings import get_settings
-    print(get_settings().directories.static_dir)
-except Exception as e:
-    pass
-" 2>/dev/null)"
-  if [ -z "$STATIC_DIR" ]; then
-    warn "找不到 backend static_dir(import miloco.config.settings 失败)"
-    warn "(尝试的 python: $MILOCO_PY)"
-  else
-    info "  STATIC_DIR=$STATIC_DIR"
-    cp -r "$WEB_DIST/." "$STATIC_DIR/"
-    info "  web/dist/* → \$STATIC_DIR/ ✓"
-    warn "提示: web 内容改了,需要重启 backend 让 spa_handler 重解析"
-  fi
-else
-  info "  web/dist/ 未提交 — 跳过 Step 1.9(后端 serve wheel 自带 bundle,功能不挂)"
-  info "  修法(开发者本地):cd web && npm install && npm run build && git add web/dist"
-  # 不调用 step / mark_done 1.9,避免日志里出现'已跳过 step 1.9'的视觉假象
+# supervisor reread + update(让新 conf 暂存,等下次 restart 应用)
+if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.sock" ]; then
+  supervisorctl -c "$SUPERVISORD_CONF" reread 2>&1 | head -3 || true
+  supervisorctl -c "$SUPERVISORD_CONF" update 2>&1 | head -3 || true
 fi
-
-# --- 1.10 patch backend(v2 per-modality toggles) ---
-# 为什么: 上游 release 是 v1 schema(CameraToggleItem 只有 did+in_use),
-# 前端 v3 感知设备列表发 video_enabled/audio_enabled 被 v1 backend strip 掉,
-# 4 个场景(单独关视频/单独关音频/批量视频开/批量音频开)全部失效。
-# 修法: fork 仓库里 v2 backend 代码(perception-toggles 分支改的)直接
-# cp 到 miloco wheel 安装目录,覆盖 v1。
-#
-# 覆盖哪些:
-#   miloco/miot/{schema,router,service,filter}.py
-#   miloco/perception/collect/camera_adapter.py
-#   miloco/database/kv_repo.py
-#
-# 跳过条件: 找不到 fork 源码目录(可能 clone 了非 integration branch)
-#  或 import miloco 失败(venv 未配)
-
-step 1.10 "patch backend (v2 per-modality toggles)"
-
-FORK_SRC="$(dirname "$(dirname "$HERE")")/backend/miloco/src/miloco"
-if [ ! -d "$FORK_SRC/miot" ]; then
-  warn "找不到 fork backend 源码: $FORK_SRC"
-  warn "(clone 的 repo 不含 backend 目录? 跳过 backend patch)"
-else
-  # 9cacc22 后新增: 探能 import miloco 的 python(uv tool 装的 miloco 不在 system python3 里)
-  # 优先级对齐 Step 1.8: config.json python_bin > uv tool > pyenv > PYTHON(兜底)
-  MILOCO_PY=""
-  if [ -f "$MILOCO_HOME/config.json" ]; then
-    _cfg_py="$("$PYTHON" -c "
-import json
-try:
-    cfg=json.load(open('$MILOCO_HOME/config.json',encoding='utf-8'))
-    print(cfg.get('server',{}).get('python_bin','') or '')
-except Exception:
-    pass
-" 2>/dev/null || true)"
-    if [ -x "$_cfg_py" ] && "$_cfg_py" -c 'import miloco' >/dev/null 2>&1; then
-      MILOCO_PY="$_cfg_py"
-    fi
-  fi
-  if [ -z "$MILOCO_PY" ]; then
-    for cand in \
-      "$HOME/.local/share/uv/tools/miloco/bin/python" \
-      "$HOME/.local/share/uv/tools/miloco/bin/python3" \
-      "$HOME/.venvs/miloco/bin/python" \
-      "$HOME/.venvs/miloco/bin/python3"
-    do
-      if [ -x "$cand" ] && "$cand" -c 'import miloco' >/dev/null 2>&1; then
-        MILOCO_PY="$cand"
-        break
-      fi
-    done
-  fi
-  [ -z "$MILOCO_PY" ] && MILOCO_PY="$PYTHON"
-  info "  MILOCO_PY = $MILOCO_PY"
-
-  # 拿 miloco package 安装目录(static_dir 往上 1 级)
-  MILOCO_PKG="$("$MILOCO_PY" -c "
-try:
-    from pathlib import Path
-    from miloco.config.settings import get_settings
-    d = Path(get_settings().directories.static_dir).parent
-    print(d)
-except Exception:
-    pass
-" 2>/dev/null || true)"
-  if [ -z "$MILOCO_PKG" ] || [ ! -d "$MILOCO_PKG/miot" ]; then
-    warn "找不到 miloco package 安装目录(import miloco 失败)"
-    warn "(venv 配错,跳过 backend patch)"
-  else
-    # 【Zirconi 6/29 review 🔴 修复】v2 per-modality 校验: fork schema 必含
-    # video_enabled / audio_enabled 才 cp v2 感知文件。否则只 cp 我的 #1/#11
-    # 改动(settings/agent_meta_poller/dispatcher/agent_platform),不动 v2 感知。
-    # 修前行为:路径对(我 4a75a67 修的)→ 每装都真执行 cp,把 v1 schema 覆盖到
-    # wheel 上还打印 "v2 per-modality ✓" — 误导用户。
-    if grep -q "video_enabled\|audio_enabled" "$FORK_SRC/miot/schema.py" 2>/dev/null; then
-      HAS_V2_PERCEPTION=1
-      info "  检测到 fork schema 含 v2 per-modality 字段,cp v2 感知文件"
-    else
-      HAS_V2_PERCEPTION=0
-      warn "  fork backend 是 v1(无 per-modality toggles),【不】cp v2 感知文件"
-      warn "  单路开关(单独关视频/音频)在本 fork 上不支持;只装 #1/#11 架构层改动"
-    fi
-
-    # --- v2 感知相关(仅 HAS_V2_PERCEPTION 时 cp)---
-    if [ "$HAS_V2_PERCEPTION" = "1" ]; then
-      # miot/(含 client.py:fork 的 client.py 不 import 上游 filter.py 的
-      # select_active_camera_dids(那个函数在 v2 拆到别处了),cp 进去才能一致)
-      for _f in schema.py router.py service.py filter.py client.py; do
-        _src="$FORK_SRC/miot/$_f"
-        _dst="$MILOCO_PKG/miot/$_f"
-        if [ -f "$_src" ]; then
-          cp "$_src" "$_dst"
-          info "  miot/$_f ✓"
-        fi
-      done
-      # perception/collect/camera_adapter.py
-      _src="$FORK_SRC/perception/collect/camera_adapter.py"
-      _dst="$MILOCO_PKG/perception/collect/camera_adapter.py"
-      if [ -f "$_src" ]; then
-        mkdir -p "$(dirname "$_dst")"
-        cp "$_src" "$_dst"
-        info "  perception/collect/camera_adapter.py ✓"
-      fi
-    done
-    # config/settings.py(主线 #1 加了 AgentSettings.platform 字段)
-    if [ -f "$FORK_SRC/config/settings.py" ]; then
-      cp "$FORK_SRC/config/settings.py" "$MILOCO_PKG/config/settings.py"
-      info "  config/settings.py ✓"
-    fi
-    # observability/agent_meta_poller.py(主线 #11 加了 _poll_once adapter 路径)
-    if [ -f "$FORK_SRC/observability/agent_meta_poller.py" ]; then
-      cp "$FORK_SRC/observability/agent_meta_poller.py" "$MILOCO_PKG/observability/agent_meta_poller.py"
-      info "  observability/agent_meta_poller.py ✓"
-    fi
-    # dispatch/dispatcher.py(#1 完成 - 去 webhook fallback)
-    if [ -f "$FORK_SRC/dispatch/dispatcher.py" ]; then
-      cp "$FORK_SRC/dispatch/dispatcher.py" "$MILOCO_PKG/dispatch/dispatcher.py"
-      info "  dispatch/dispatcher.py ✓"
-    fi
-    # agent_platform/(主线 #1,backend AgentPlatformAdapter ABC + loader)
-    if [ -d "$FORK_SRC/agent_platform" ]; then
-      mkdir -p "$MILOCO_PKG/agent_platform"
-      cp -r "$FORK_SRC/agent_platform/." "$MILOCO_PKG/agent_platform/"
-      info "  agent_platform/ ✓(整目录 cp)"
-    fi
-    warn "提示: backend 文件已更新(架构层),需要重启 backend"
-    warn "      miloco-cli service restart 后新 dispatcher 走 adapter 路径"
-  fi
-fi
-mark_done 1.10
+mark_done 1.9
 
 # --- 2. 拿/复用 Bearer ---
 step 2 "拿/复用 adapter Bearer"
@@ -761,20 +643,56 @@ cp -r "$HERE/skills"/miloco-* "$HERMES_HOME/skills/"
 mark_done 3
 
 # --- 4. 复制插件 ---
-# 【hermes-pr.md §五 #1 完成】删除原"独立 aiohttp adapter 进程"栈:
-#   - plugins/hermes/adapter/ 不再 cp(整个目录即将从 repo 删)
-#   - scripts/miloco-adapter.sh / adapter-launcher.sh / com.xiaomi.miloco.hermes.adapter.plist
-#     不再 cp / chmod(没有独立进程了)
-# 入站改走 backend AgentPlatformAdapter -> HermesAdapter -> OpenAI /v1/chat/completions,
-# Adapter 随 plugin 装到 $MILOCO_HOME/agent_platform/hermes/(见 Step 4.8)。
 step 4 "复制 Hermes 插件 → ${HERMES_PLUGINS_DIR}/"
 mkdir -p "$HERMES_PLUGINS_DIR"
 info "  复制 miloco-plugin/"
 rm -rf "$HERMES_PLUGINS_DIR/miloco-plugin"
 cp -r "$HERE/miloco-plugin" "$HERMES_PLUGINS_DIR/miloco-plugin"
+# 架构 #1+#2 收敛:pr-hermes 已删独立 aiohttp 进程 + plugins/hermes/adapter/ 整个目录。
+# 入站 webhook 由 backend 侧 AgentPlatformAdapter 接管(plugins/hermes/miloco-plugin/hermes_adapter/adapter.py)。
+# 此处只删旧 adapter/ 残留,不复制任何"老 adapter"。
+rm -rf "$HERMES_PLUGINS_DIR/adapter"
 # 清 pycache + 预编译（首次启动少 ~2s）
 find "$HERMES_PLUGINS_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 "$PYTHON" -m compileall -q "$HERMES_PLUGINS_DIR/miloco-plugin" 2>/dev/null || true
+
+# --- 4.x 部署 AgentPlatformAdapter 到 MILOCO_HOME ---
+# backend loader (backend/miloco/src/miloco/agent_platform/loader.py) 按
+# settings.agent.platform 从 $MILOCO_HOME/agent_platform/<name>/ 加载 adapter.py,
+# submodule_search_locations 指向该目录,所以 adapter.py 内 from .xxx import 的
+# 所有依赖文件(context_injection/catalog/paths) 必须也在同目录。
+ADAPTER_DEST="$MILOCO_HOME/agent_platform/hermes"
+mkdir -p "$ADAPTER_DEST"
+for f in __init__.py adapter.py; do
+  cp -f "$HERE/miloco-plugin/hermes_adapter/$f" "$ADAPTER_DEST/$f"
+done
+for f in context_injection.py catalog.py paths.py; do
+  cp -f "$HERE/miloco-plugin/$f" "$ADAPTER_DEST/$f"
+done
+# 清旧的 adapter/ 目录残留(独立 aiohttp 进程栈,架构 #1+#2 后不再用)
+rm -rf "$MILOCO_HOME/agent_platform/adapter"
+info "  部署 AgentPlatformAdapter → $ADAPTER_DEST/"
+
+# adapter-launcher.sh 要可执行（macOS launchd plist 调它）
+chmod +x "$HERE/scripts/adapter-launcher.sh" 2>/dev/null || true
+
+# 把 adapter 启停脚本复制到 plugins/ 下（agent / 自检工具按固定路径找）
+# 之前只 chmod 不复制，导致 miloco_status fix 提示的 `bash plugins/hermes/scripts/miloco-adapter.sh start`
+# 在用户 cwd 不是 fork 根目录时找不到。复到 ~/.hermes/plugins/miloco/ 下后绝对路径稳定。
+info "  复制 miloco-adapter.sh（adapter 启停 wrapper）"
+mkdir -p "$HERMES_PLUGINS_DIR/scripts"
+cp -f "$HERE/scripts/miloco-adapter.sh" "$HERMES_PLUGINS_DIR/scripts/miloco-adapter.sh"
+chmod +x "$HERMES_PLUGINS_DIR/scripts/miloco-adapter.sh"
+# 复制 miloco-notify.py(IM 渠道切换的确定性 wrapper,不走 LLM,避免 oc id 被改坏)
+cp -f "$HERE/scripts/miloco-notify.py" "$HERMES_PLUGINS_DIR/scripts/miloco-notify.py"
+chmod +x "$HERMES_PLUGINS_DIR/scripts/miloco-notify.py"
+
+# 建 ~/.hermes/memory/(感知 cron skill 写感知摘要的目标目录)。首次跑 cron 时
+# skill 会 `ls /Users/wkea/memory/<date>-miloco-perception.md`,目录不存在会报
+# "No such file or directory"。这里是 cron 链路真 bug —— skill 写文件前必须
+# 保证父目录存在。
+mkdir -p "$HERMES_HOME/memory"
+
 mark_done 4
 
 # --- 4.5 自动探测 Hermes 已配置的 IM 平台，写入插件 state.json ---
@@ -809,12 +727,75 @@ if [ "$RESET_DELIVER" -eq 0 ] && [ -f "$PLUGIN_STATE" ]; then
   PRESERVED_TARGET="$(jq -r '.deliver.target // ""' "$PLUGIN_STATE" 2>/dev/null || echo "")"
 fi
 
-"$PYTHON" "$HERE/scripts/write_state_json.py" "$PLUGIN_STATE" "$DETECTED_TARGETS_JSON" "$PRESERVED_TARGET"
+# --- 4.5b 交互式问询通知策略（仅 TTY + 候选 ≥ 2 时）---
+# 决定 deliver.target：
+#   - "--notify-mode=fanout"  → 全部发（target="all"）
+#   - "--notify-mode=single --notify-primary=N"  → 选 candidates[N-1]
+#   - 已有 PRESERVED_TARGET（"all" 或具体 target）  → 保留
+#   - TTY + 候选 ≥ 2  → 问用户（不打断已 --notify-mode/-primary 显式传的）
+#   - 其他  → 默认 candidates[0]
+CHOSEN_TARGET=""
+if [ -n "$NOTIFY_MODE" ]; then
+  # 显式 env/CLI 覆盖：走指定
+  case "$NOTIFY_MODE" in
+    fanout|all)  CHOSEN_TARGET="all" ;;
+    single|one)
+      idx="${NOTIFY_PRIMARY:-1}"
+      # 校验 idx 合法
+      if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$CANDIDATES_COUNT" ]; then
+        warn "--notify-primary=$idx 非法（候选 ${CANDIDATES_COUNT} 个）改用默认 1"
+        idx=1
+      fi
+      CHOSEN_TARGET="$(jq -r ".targets[$((idx-1))]" <<< "$DETECTED_TARGETS_JSON")"
+      ;;
+    *)
+      warn "--notify-mode=$NOTIFY_MODE 非法（fanout/single）忽略"
+      ;;
+  esac
+elif [ "$RESET_DELIVER" -ne 1 ] && [ -n "$PRESERVED_TARGET" ]; then
+  # 保留旧 target（包括 "all"）
+  CHOSEN_TARGET="$PRESERVED_TARGET"
+elif [ "$CANDIDATES_COUNT" -ge 2 ] && [ -t 0 ]; then
+  # 交互：TTY + 多个 IM 候选才问
+  echo
+  info "检测到 ${CANDIDATES_COUNT} 个 IM 渠道:"
+  i=0
+  while [ "$i" -lt "$CANDIDATES_COUNT" ]; do
+    t="$(jq -r ".targets[$i]" <<< "$DETECTED_TARGETS_JSON")"
+    echo "  [$((i+1))] $t"
+    i=$((i + 1))
+  done
+  echo
+  echo "  [A] 全部发 (fanout, target=\"all\")"
+  echo
+  printf "选择通知策略 [1-%d/A/默认 1]: " "$CANDIDATES_COUNT"
+  read -r NOTIFY_CHOICE
+  case "$(printf '%s' "$NOTIFY_CHOICE" | tr '[:upper:]' '[:lower:]')" in
+    a|all|fanout) CHOSEN_TARGET="all" ;;
+    "")
+      CHOSEN_TARGET="$(jq -r '.targets[0]' <<< "$DETECTED_TARGETS_JSON")"
+      ;;
+    *)
+      if [[ "$NOTIFY_CHOICE" =~ ^[0-9]+$ ]] && [ "$NOTIFY_CHOICE" -ge 1 ] && [ "$NOTIFY_CHOICE" -le "$CANDIDATES_COUNT" ]; then
+        CHOSEN_TARGET="$(jq -r ".targets[$((NOTIFY_CHOICE-1))]" <<< "$DETECTED_TARGETS_JSON")"
+      else
+        warn "无效选择 '$NOTIFY_CHOICE' 改用默认 1"
+        CHOSEN_TARGET="$(jq -r '.targets[0]' <<< "$DETECTED_TARGETS_JSON")"
+      fi
+      ;;
+  esac
+fi
+# CHOSEN_TARGET 此时：空 → 用 candidates[0]（fallback）;否则用选中的
+if [ -z "$CHOSEN_TARGET" ] || [ "$CHOSEN_TARGET" = "null" ]; then
+  CHOSEN_TARGET="$(jq -r '.targets[0] // ""' <<< "$DETECTED_TARGETS_JSON")"
+fi
 
-if [ -n "$DETECTED_TARGET" ]; then
-  info "通知投递已自动配置 target=${DETECTED_TARGET} 候选 ${CANDIDATES_COUNT} 个 写入 state.json.candidates"
-elif [ -n "$PRESERVED_TARGET" ]; then
-  info "未检测到新 IM 平台 复用旧 deliver.target=$PRESERVED_TARGET"
+"$PYTHON" "$HERE/scripts/write_state_json.py" "$PLUGIN_STATE" "$DETECTED_TARGETS_JSON" "$CHOSEN_TARGET"
+
+if [ "$CHOSEN_TARGET" = "all" ]; then
+  info "通知投递已配置 target=all (fanout 到 ${CANDIDATES_COUNT} 个 IM 渠道)"
+elif [ -n "$CHOSEN_TARGET" ] && [ "$CHOSEN_TARGET" != "null" ]; then
+  info "通知投递已配置 target=${CHOSEN_TARGET} (单渠道,共 ${CANDIDATES_COUNT} 个候选)"
 else
   warn "未检测到 Hermes 已配置的 IM 平台 auth.json / config.yaml 都空"
   warn "miloco 主动通知将无法送达 miloco_im_push 会返回 no deliver target"
@@ -877,91 +858,55 @@ PY
 fi
 mark_done 4.7
 
-# --- 4.8 cp HermesAdapter 到 ${MILOCO_HOME}/agent_platform/hermes/ ---
-# hermes-pr.md §五 主线 #1:Backend AgentPlatformAdapter 通过 importlib 从这里加载 hermes 实现。
-# 完整路径 = $MILOCO_HOME/agent_platform/hermes/adapter.py,缺一即加载失败 → backend fallback webhook。
-# 同步写 settings.agent.platform="hermes",让 dispatcher 走 adapter 路径。
-# 注意 adapter 用 ``from .context_injection`` / ``.paths`` / ``.catalog`` 相对导入,
-# 这 3 个 sibling 模块必须一并 cp,否则 import 链断(adapter 不能跑)。
-step 4.8 "cp HermesAdapter → ${MILOCO_HOME}/agent_platform/hermes/"
-ADAPTER_DEST="$MILOCO_HOME/agent_platform/hermes"
-ADAPTER_SRC="$HERE/miloco-plugin/hermes_adapter"
-PLUGIN_SRC="$HERE/miloco-plugin"
-if [ ! -d "$ADAPTER_SRC" ]; then
-  warn "找不到 hermes_adapter 源目录: $ADAPTER_SRC"
-  warn "(plugin 结构异常? 跳过 adapter cp → backend 走 webhook 模式)"
-else
-  mkdir -p "$ADAPTER_DEST"
-  rm -rf "$ADAPTER_DEST"
-  cp -r "$ADAPTER_SRC" "$ADAPTER_DEST"
-  # 拷贝 adapter 相对导入的 3 个 sibling 模块(context_injection / paths / catalog)。
-  # 这些模块 plugin 本身也在用(legacy pre_llm_call),此处 cp 一份让 adapter package
-  # 自包含,后续如果 plugin 端 context_injection 改了,这里需同步(暂时手动)。
-  for _mod in context_injection.py paths.py catalog.py; do
-    if [ -f "$PLUGIN_SRC/$_mod" ]; then
-      cp "$PLUGIN_SRC/$_mod" "$ADAPTER_DEST/$_mod"
-    fi
-  done
-  info "  HermesAdapter → $ADAPTER_DEST ✓ (含 context_injection / paths / catalog 副本)"
-  # 写 settings.agent.platform="hermes"(backend 启动时按此加载 adapter)
-  if [ -f "$MILOCO_HOME/config.json" ]; then
-    "$PYTHON" - "$MILOCO_HOME" "hermes" <<'PY' 2>/dev/null || true
-import json, sys
-home, platform = sys.argv[1], sys.argv[2]
-p = f"{home}/config.json"
-try:
-    cfg = json.load(open(p, encoding="utf-8"))
-except Exception:
-    cfg = {}
-cfg.setdefault("agent", {})
-cfg["agent"]["platform"] = platform
-json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-print(f"  config.json::agent.platform = {platform}")
-PY
-  fi
-  warn "提示: backend 启动时自动加载 HermesAdapter,优先走 OpenAI 直调通路,"
-  warn "      旧的 :18789 webhook + 独立 adapter 进程将作为 fallback。"
-fi
-mark_done 4.8
+# --- 5. patch ${MILOCO_HOME}/config.json (走 miloco-cli config set) ---
+# Author #7 收敛:不再直接编辑 config.json 结构,改用 miloco-cli config set 写 agent.*
+# (CLI 是 source of truth,插件不碰 config.json schema —— 未来 CLI 改键名不影响)
+step 5 "miloco-cli config set 写 agent.webhook_url + agent.auth_bearer"
+WEBHOOK_URL="http://127.0.0.1:${ADAPTER_PORT}/miloco/webhook"
 
-# --- 5. patch ${MILOCO_HOME}/config.json ---
-step 5 "patch ${MILOCO_HOME}/config.json 的 agent 段(平台名)"
-# 【hermes-pr.md §五 #1 完成】原 PR #279 写 webhook_url + auth_bearer 给独立 adapter 进程
-# 用;现在 agent 只剩 platform 字段(backend 按此加载 Adapter),webhook_url/auth_bearer
-# 由 AgentPlatformAdapter 启动时读 $MILOCO_HOME/agent_platform/<name>/ 自管。
-
-# backup 文件名加 PID + 纳秒,避免 30s 内 reinstall 撞名
+# 备份一次(防御:miloco-cli config set 若实现改了 schema,rollback 用)
 TS="$(date +%Y%m%d-%H%M%S)-pid$$-nsec$(date +%N)"
-cp "$MILOCO_HOME/config.json" "${MILOCO_HOME}/config.json.bak-${TS}"
-
-# 清理老备份：保留最新 3 份,避免 config.json.bak-* 累积(重装 N 次 → N 份)
-# 用 ls -1t 按时间倒序,tail -n +4 跳过前 3 行(即保留最新 3),其余删
-old_baks="$(ls -1t "${MILOCO_HOME}"/config.json.bak-* 2>/dev/null | tail -n +4 || true)"
-if [ -n "$old_baks" ]; then
-  rm -f $old_baks
-  info "  清理老 config.json.bak:保留最新 3 份"
+if [ -f "$MILOCO_HOME/config.json" ]; then
+  cp "$MILOCO_HOME/config.json" "${MILOCO_HOME}/config.json.bak-${TS}"
+  # 清理老备份:保留最新 3 份
+  old_baks="$(ls -1t "${MILOCO_HOME}"/config.json.bak-* 2>/dev/null | tail -n +4 || true)"
+  if [ -n "$old_baks" ]; then
+    rm -f $old_baks
+    info "  清理老 config.json.bak:保留最新 3 份"
+  fi
 fi
-# 【hermes-pr.md §五 #7 收敛】改用 miloco-cli config set 写 platform,plugin 不直接
-# 碰 config.json 的内部结构(走 CLI,未来 miloco 配置模型升级时 plugin 不需要适配)。
-# 与 Step 4.8 幂等(都写 platform,后写覆盖前写)。
-# --no-restart:本步不触发 service restart(由 install 全流程结束后用户/外部触发)。
-if miloco-cli config set agent.platform hermes --no-restart >/dev/null 2>&1; then
+
+# 走 CLI 写(Author #7:插件不碰 config.json 结构)
+if miloco-cli config set agent.webhook_url "$WEBHOOK_URL" 2>&1 | tail -3; then
+  info "  webhook_url = $WEBHOOK_URL (via miloco-cli config set)"
+else
+  err "miloco-cli config set agent.webhook_url 失败"
+  exit 1
+fi
+if miloco-cli config set agent.auth_bearer "$BEARER" 2>&1 | tail -3; then
+  info "  auth_bearer = ${BEARER:0:8}... (via miloco-cli config set)"
+else
+  err "miloco-cli config set agent.auth_bearer 失败"
+  exit 1
+fi
+# 🔴#2 修复: 写 agent.platform=hermes 让 backend loader 加载 Adapter
+# 不写则 loader 返回 None → dispatcher 静默丢弃所有入站 turn
+if miloco-cli config set agent.platform hermes 2>&1 | tail -3; then
   info "  agent.platform = hermes (via miloco-cli config set)"
 else
-  warn "  miloco-cli config set 失败,降级用 python 直写 config.json:"
-  "$PYTHON" - "$MILOCO_HOME" "hermes" <<'PY' || true
-import json, sys
-home, platform = sys.argv[1], sys.argv[2]
-p = f"{home}/config.json"
-try:
-    cfg = json.load(open(p, encoding="utf-8"))
-except Exception:
-    cfg = {}
-cfg.setdefault("agent", {})
-cfg["agent"]["platform"] = platform
-json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-print(f"  agent.platform = {platform}(fallback)")
-PY
+  # miloco-cli 可能不认识 agent.platform(旧版 CLI,PR 未合)
+  # 降级: Python 直写 config.json
+  warn "  miloco-cli config set agent.platform 失败,降级为 Python 直写 config.json"
+  "$PYTHON" -c "
+import json
+p = r'$MILOCO_HOME/config.json'
+with open(p) as f:
+    d = json.load(f)
+d.setdefault('agent', {})['platform'] = 'hermes'
+with open(p, 'w') as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+print('agent.platform = hermes 已写入')
+" && info "  agent.platform = hermes (via Python 直写)" || { err "agent.platform 写入失败"; exit 1; }
 fi
 mark_done 5
 
@@ -977,28 +922,15 @@ else
 fi
 mark_done 6
 
-# --- 7. (deprecated)原 PR #279 启 adapter ---
-# 【hermes-pr.md §五 #1 完成】不再启动独立 adapter 进程 — 入站改走 backend
-# AgentPlatformAdapter。无 standalone aiohttp server,无 launchd plist。
-# Step 7 保留为空以便脚本流程不被 break;若发现独立 adapter 还在跑(macOS launchd
-# 残留 / Linux 后台进程),记录提示用户手动清理,不再自动拉起。
-step 7 "(deprecated) 检测并提示清理残留 adapter(原 PR #279)"
-if [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
-  if launchctl list 2>/dev/null | grep -q "com.xiaomi.miloco.hermes.adapter"; then
-    warn "  发现 launchd 残留 com.xiaomi.miloco.hermes.adapter(原 PR #279 独立 adapter 进程)"
-    warn "  自动 unload + 删除 plist:"
-    launchctl unload "$HOME/Library/LaunchAgents/com.xiaomi.miloco.hermes.adapter.plist" 2>/dev/null || true
-    rm -f "$HOME/Library/LaunchAgents/com.xiaomi.miloco.hermes.adapter.plist"
-    info "  已清理 launchd 残留"
-  fi
-fi
-# 端口 18789 残留进程检查(无 plist 也会残留)
-_stale_pid="$(get_pid_by_port "$ADAPTER_PORT" 2>/dev/null | tr -d ' \r\n' || true)"
-if [ -n "$_stale_pid" ]; then
-  warn "  端口 $ADAPTER_PORT 还被 PID=$_stale_pid 占着(原 adapter 残留)"
-  warn "  自动 kill:"
-  kill_pid "$_stale_pid"
-  info "  已清理"
+# --- 7. 重启 backend ---
+# 架构 #1+#2 后适配器收敛到 miloco backend 的 AgentPlatformAdapter。
+# 委托给 scripts/miloco-adapter.sh start（管 supervisord / miloco-backend）。
+# 旧 launchd / nohup adapter 进程已被清理。
+step 7 "重启 backend (supervisord)"
+info "  委托给 scripts/miloco-adapter.sh（管 supervisord / miloco-backend）"
+if ! bash "$HERE/scripts/miloco-adapter.sh" start; then
+  err "backend 启动失败"
+  exit 1
 fi
 mark_done 7
 
@@ -1007,10 +939,8 @@ step 8 "enable Hermes 插件 miloco"
 # plugin.yaml 里的 name 字段是 'miloco'，enable 时用它
 if command -v hermes >/dev/null 2>&1; then
   # 已 enabled 跳过；未 enabled 才 enable
-  # 注意：hermes plugins list 表格里 not enabled 和 enabled 都有 'enabled' 子串，
-  # 老版 grep "miloco.*enabled" 会把 not enabled 误判成 enabled 导致跳过 enable。
-  # --plain --no-bundled + "^enabled.*miloco$" 是 column-agnostic 的严格匹配，
-  # 不依赖终端 Unicode 框线字符渲染。对齐 install-guide-hermes.md 的写法。
+  # 对齐 install-guide-hermes.md:295 的严格模式：^enabled.*miloco$
+  # 行内 "enabled" 在前、"miloco" 在后，避免 not enabled 假阳性
   if hermes plugins list --plain --no-bundled 2>/dev/null | grep -E "^enabled.*miloco$" >/dev/null 2>&1; then
     info "  已是 enabled，跳过"
   else
@@ -1124,25 +1054,22 @@ cat <<EOF
 [试一下]
     hermes chat -q "把客厅灯打开" -Q
 
-[【hermes-pr.md §五 #1 完成】adapter 状态]
-    入站已从独立 aiohttp 进程改为 backend AgentPlatformAdapter 直调。
-    端口 18789 已被弃用,无独立 adapter 进程(Step 7 已自动清理 launchd 残留)。
-    调试入口:
-      bash plugins/hermes/install-hermes.sh --diagnose   # 链路自检
-      curl -sS http://127.0.0.1:1810/health              # backend 健康
-      /Users/wkea/.openclaw/miloco/log/miloco-backend.log  # backend 日志
-      /Users/wkea/.hermes/miloco-adapter.log            # adapter 旧日志(若还有)
+[backend 状态]
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh status    # 看 supervisord / backend
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh logs      # tail 日志
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh restart   # 重启
+    bash ~/.hermes/plugins/miloco/scripts/miloco-adapter.sh stop      # 停
 
 [配置文件位置]
-$MILOCO_HOME/config.json   # miloco 后端配置（已写 agent.platform='hermes'）
-     $HERMES_HOME/.env          # Hermes 环境（已追加 API_SERVER_KEY）
-     $PLUGIN_STATE              # 插件 deliver.target
+    $MILOCO_HOME/config.json   # miloco 后端配置（已 patch）
+    $HERMES_HOME/.env          # Hermes 环境（已追加 API_SERVER_KEY）
+    $PLUGIN_STATE              # 插件 deliver.target
+    $MILOCO_HOME/log/          # backend 日志
 
 [想还原]
     ${MILOCO_HOME}/config.json.bak-${TS}  是 patch 前的备份
     $HERMES_HOME/.env 里去掉 API_SERVER_KEY 即可
     卸插件：rm -rf $HERMES_PLUGINS_DIR $HERMES_HOME/skills/miloco-*
-             $MILOCO_HOME/agent_platform/hermes
     disable 插件：hermes plugins disable miloco
 
 [详细文档] $HERE/README.md

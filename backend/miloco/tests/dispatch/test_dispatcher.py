@@ -23,6 +23,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from miloco.agent_platform.base import AdapterTransportError
 from miloco.config import get_settings
 from miloco.dispatch import (
     AgentDispatcher,
@@ -33,8 +34,6 @@ from miloco.dispatch import (
 )
 from miloco.dispatch import dispatcher as disp_mod
 from miloco.dispatch.dispatcher import _QueuedEvent
-from miloco.middleware.exceptions import AgentWebhookException  # legacy alias, kept for test back-compat
-from miloco.agent_platform.base import AdapterTransportError
 
 # 队列上限的唯一真源现为 settings；测试读取它，与 dispatcher._enforce_cap 同源。
 MAX_QUEUE = get_settings().dispatcher.max_queue
@@ -433,8 +432,9 @@ async def test_transport_exception_retries_then_skips_and_survives(patched, monk
     finally:
         await d.stop()
 
-    # 传输失败被重试 _TRANSPORT_RETRIES+1 次后跳过该批,drainer 存活、不写 agent_runs。
-    assert calls == d._TRANSPORT_RETRIES + 1
+    # 传输失败: adapter 路径不重试,只报告一次错误即跳过该批。
+    # 旧 webhook 路径才重试 _TRANSPORT_RETRIES+1 次。
+    assert calls == 1
     assert patched.tracks == []
 
 

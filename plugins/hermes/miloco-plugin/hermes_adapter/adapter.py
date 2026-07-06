@@ -3,7 +3,7 @@
 设计:见 ``hermes-pr.md`` §五 #1+#2+#11。本文件由 backend importlib 动态加载,
 不需要也不应该 import 后端 wheel 的任何符号(duck-typed)。
 
-Hermes /v1/chat/completions 协议(对齐 ``plugins/hermes/adapter/hermes_client.py`` 现有逻辑):
+Hermes /v1/chat/completions 协议(OpenAI 兼容 Chat Completions API):
 - 请求: ``{"messages": [{"role": "system", ...}, {"role": "user", ...}], "model"?: "..."}``
 - 响应: 标准 OpenAI 风格 ``{"choices": [{"message": {"content": "..."}}]}``
 - 头: ``Authorization: Bearer $API_SERVER_KEY``、``X-Hermes-Session-Id: <session_id>``
@@ -109,7 +109,7 @@ def _resolve_trace_dir() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Session mapping(从 ``plugins/hermes/adapter/session_map.py`` 简化版搬过来)
+# Session mapping(内联实现,原独立 adapter 已删)
 # ---------------------------------------------------------------------------
 
 
@@ -325,18 +325,17 @@ class Adapter:
     # ---- read_trace_meta ----------------------------------------------
 
     async def read_trace_meta(self, run_id: str) -> Optional[Any]:
-        """读 ``$MILOCO_HOME/trace/agent/<run_id>.meta.json`` → ``TraceMeta``-like 对象。
+        """读 ``$MILOCO_HOME/trace/agent/<YYYYMMDD>/<runId>__<query>.meta.json`` → TraceMeta-like。
 
-        返回类型 duck-typed:暴露 ``run_id`` / ``query`` / ``duration_ms`` /
-        ``llm_call_count`` / ``tool_call_count`` / ``llm_total_ms`` /
-        ``tool_total_ms`` / ``tool_max_ms`` / ``slowest_tool_name`` / ``success`` /
-        ``error_count`` / ``error_msg`` / ``jsonl_path``。
-
-        本 session 暂未重构 ``trace.py`` 写盘,通常返回 None。Backend poller 走超时分支。
+        trace.py 写带日期子目录+query后缀,此处 glob 搜索匹配。
         """
-        meta_path = self._trace_dir / f"{run_id}.meta.json"
-        if not meta_path.is_file():
+        candidates = sorted(
+            self._trace_dir.rglob(f"*{run_id}*.meta.json"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if not candidates:
             return None
+        meta_path = candidates[0]
         try:
             data = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

@@ -85,13 +85,9 @@ section "4. im_push 实际 IM 投递"
 # 先切换到飞书(避免微信 iLink rate limit)
 "$HERMES_BIN" chat -q "调miloco_notify_bind action=switch target=feishu:oc_806ed7124bae73745846704be33ae2b3" -Q >/dev/null 2>&1
 PUSH_RESULT=$("$HERMES_BIN" chat -q "调miloco_im_push发:【e2e test】pr-hermes test_e2e_real.sh $(date '+%H:%M:%S')" -Q 2>&1 | tail -5)
-# 成功标志:agent 报 ok=true / 已送达 / 飞书(中文宽松匹配)
-# agent 表达方式多样:'ok:true' / '已送达' / '推送到飞书' / '搞定。已推到飞书。'
-# 用 1 个正则盖住所有"OK 类"标志 + 1 个"无失败"标志(agent 无"失败/error/失败"字)
-if echo "$PUSH_RESULT" | grep -qE "ok:\s*true|已送达|推送成功|✅|飞书.*ok|发了.*飞书|平台.*ok|搞定.*推到|已.*推.*飞书|已.*送.*飞书"; then
+# 成功标志:agent 报 ok=true / 已送达 / 飞书(中文)
+if echo "$PUSH_RESULT" | grep -qE "ok:\s*true|已送达|推送成功|✅"; then
   ok "im_push 真发成功(ok=true / 飞书已送达)"
-elif ! echo "$PUSH_RESULT" | grep -qE "失败|error|err|❌|失败:|rate limit"; then
-  ok "im_push 真发成功(agent 报无失败)"
 else
   fail "im_push 失败: $PUSH_RESULT"
 fi
