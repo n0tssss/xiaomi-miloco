@@ -4,7 +4,7 @@ description: miloco-perception-digest 定时任务的内部步骤，仅由该任
 metadata:
   author: miloco
   version: "1.1"
-  date: 2026-06-16
+  date: "2026-06-16"
 ---
 
 # 感知日志摘要
